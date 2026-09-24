@@ -1,4 +1,4 @@
-"""지출결의 업무 자동화 (Streamlit)
+"""지출결의 업무 (Streamlit)
 
 지출결의서 내역을 입력하면 아래 결과물을 자동 생성한다.
   - 품의서 하단 문구 (1. 주요내용 / 2. 사유 / 3. 첨부 / 4. 특이사항)
@@ -31,7 +31,10 @@ from openpyxl.utils import get_column_letter
 # ---------------------------------------------------------------------------
 # 상수
 # ---------------------------------------------------------------------------
-ITEM_COLUMNS = ["품목", "업체명", "수량", "단가", "배송비", "비고"]
+ITEM_COLUMNS = ["품목", "업체명", "수량", "단가", "배송비", "비고"]  # 사용자가 입력하는 칸
+ITEM_COMPUTED = ["순번", "공급가액", "부가세", "합계"]  # 자동 계산 칸 (편집 불가)
+EDITOR_COLUMNS = ["선택", "순번", "품목", "업체명", "수량", "단가", "공급가액", "부가세", "배송비", "합계", "비고"]
+EDITOR_NUMBER_COLUMNS = ["순번", "수량", "단가", "공급가액", "부가세", "배송비", "합계"]
 
 VAT_MODES = {
     "별도 (단가 = 공급가액)": "exclusive",
@@ -74,7 +77,30 @@ EXP_SECTION_NAMES = {"주요내용": "주요내용", "사유": "사    유", "�
 EMPTY_MARKERS = {"", "없음", "-", "--", "해당없음", "해당 없음", "n/a", "na", "x", "無"}  # 이 값뿐이면 항목 생략
 KO_ENUM = "가나다라마바사아자차카타파하"
 PAY_METHODS = ["송금", "법인카드", "자동이체", "현금"]
-EVIDENCE_TYPES = ["세금계산서 - 전자", "세금계산서 - 종이", "계산서", "카드전표", "현금영수증", "영수증", "기타"]
+EVIDENCE_TYPES = ["-", "세금계산서 - 전자", "세금계산서 - 종이", "계산서", "카드전표", "현금영수증", "영수증", "기타"]
+BANKS = ["KB국민은행", "신한은행", "우리은행", "하나은행", "NH농협은행", "IBK기업은행", "SC제일은행", "한국씨티은행",
+         "KDB산업은행", "Sh수협은행", "iM뱅크(대구은행)", "부산은행", "경남은행", "광주은행", "전북은행", "제주은행",
+         "카카오뱅크", "케이뱅크", "토스뱅크"]  # 제1금융권 — 목록에 없으면 직접 입력
+
+# ---- 입력 폼 (위젯 key → 초기값). 임시저장·불러오기·새로 작성이 이 key들을 사용 ----
+FORM_DATE_KEYS = ("f_write_date", "f_pay_date")
+
+
+def form_defaults() -> dict:
+    today = date.today()
+    return {
+        "f_write_date": today, "f_pay_date": today, "f_payer": "GSI", "f_urgent": False,
+        "f_pay_method": PAY_METHODS[0], "f_evidence": EVIDENCE_TYPES[0], "f_vat": list(VAT_MODES)[0],
+        "f_subject": "", "f_bank": None, "f_account": "", "f_holder": "",
+        "f_reason": "", "f_attachment": "", "f_remark": "",
+    }
+
+
+# ---- 임시저장 ----
+DRAFTS_PATH = Path(os.environ.get("JICHUL_DRAFTS_PATH") or APP_DIR / "drafts.json")
+
+# ---- 탭 ----
+TAB_WRITE, TAB_LEDGER, TAB_DRAFTS = "1. 지출결의서 작성", "2. 발급 대장", "3. 임시저장 목록"
 
 # ---- 발급 대장 ----
 HISTORY_PATH = Path(os.environ.get("JICHUL_HISTORY_PATH") or APP_DIR / "history.csv")  # 환경변수로 위치 변경 가능
@@ -86,8 +112,9 @@ STATUS_DRAFT = "🟡 1. 기안작성 중"          # 문서번호 없음
 STATUS_SUBMITTED = "🔵 2. 상신완료/진행 중"  # 문서번호 입력 또는 완료기안 발급
 STATUS_DONE = "🟢 3. 최종승인 완료"          # 승인완료 체크
 STATUS_FILTERS = {"전체": None, "기안작성": STATUS_DRAFT, "상신완료": STATUS_SUBMITTED, "최종승인완료": STATUS_DONE}
-LEDGER_VIEW_COLUMNS = ["상태", "승인완료", "작성일", "문서번호", "건명", "지급처", "기안자", "합계", "공급가액", "부가세",
-                       "품목수", "출금회사", "입금요청일", "긴급", "은행", "계좌번호", "예금주", "기안부서",
+STATUS_LEGEND = "🟡 기안 작성 중 (문서번호 미입력) · 🔵 상신 완료/결재 진행 중 (문서번호 입력) · 🟢 최종 승인 완료"
+LEDGER_VIEW_COLUMNS = ["상태", "건명", "작성일", "문서번호", "승인완료", "지급처", "합계", "공급가액", "부가세",
+                       "품목수", "기안자", "출금회사", "입금요청일", "긴급", "은행", "계좌번호", "예금주", "기안부서",
                        "지출결의서 발급", "완료기안 발급", "승인일시"]
 
 
@@ -110,7 +137,60 @@ def _text(value) -> str:
     return str(value).strip()
 
 
-def compute_items(df: pd.DataFrame, vat_mode: str, default_vendor: str) -> pd.DataFrame:
+def _opt_num(value) -> float:
+    """빈칸은 NaN 그대로 (표에서 빈칸으로 보이도록)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+    return v
+
+
+def _flag(value) -> bool:
+    return value is not None and not (isinstance(value, float) and math.isnan(value)) and bool(value)
+
+
+def _amounts(qty: float, price: float, ship: int, vat_mode: str) -> tuple[int, int]:
+    """(공급가액, 부가세). 양식 기준: 배송비도 과세 대상 → 공급가액 = 수량×단가 + 배송비, 부가세 = 공급가액의 10%
+    (예: 지출결의서 소계 418,000 → 부가세 41,800 / 완료기안 공급가액 418,000)."""
+    gross = int(round(qty * price)) + ship
+    if vat_mode == "exclusive":
+        return gross, int(gross * 0.1)
+    if vat_mode == "inclusive":
+        supply = int(round(gross / 1.1))
+        return supply, gross - supply
+    return gross, 0
+
+
+def blank_items(n: int = 1) -> pd.DataFrame:
+    return normalize_items(pd.DataFrame([{} for _ in range(n)], columns=EDITOR_COLUMNS), "exclusive")
+
+
+def normalize_items(df: pd.DataFrame, vat_mode: str) -> pd.DataFrame:
+    """내역 입력 표 정리 + 자동 계산 칸(순번·공급가액·부가세·합계) 채움. 같은 입력이면 항상 같은 결과."""
+    rows, seq = [], 0
+    for r in df.to_dict("records"):
+        name = _text(r.get("품목"))
+        row = {
+            "선택": _flag(r.get("선택")), "순번": math.nan, "품목": name, "업체명": _text(r.get("업체명")),
+            "수량": _opt_num(r.get("수량")), "단가": _opt_num(r.get("단가")),
+            "공급가액": math.nan, "부가세": math.nan, "배송비": _opt_num(r.get("배송비")), "합계": math.nan,
+            "비고": _text(r.get("비고")),
+        }
+        if name:
+            seq += 1
+            supply, vat = _amounts(_num(row["수량"]), _num(row["단가"]), int(round(_num(row["배송비"]))), vat_mode)
+            row.update({"순번": seq, "공급가액": supply, "부가세": vat, "합계": supply + vat})
+        rows.append(row)
+    out = pd.DataFrame(rows, columns=EDITOR_COLUMNS)
+    out["선택"] = out["선택"].astype(bool)
+    out[EDITOR_NUMBER_COLUMNS] = out[EDITOR_NUMBER_COLUMNS].astype(float)
+    for col in ("품목", "업체명", "비고"):
+        out[col] = out[col].astype(str)
+    return out
+
+
+def compute_items(df: pd.DataFrame, vat_mode: str, default_vendor: str = "") -> pd.DataFrame:
     """입력 표 → 공급가액/부가세/배송비/합계가 계산된 표 (빈 행 제외)."""
     rows = []
     for _, r in df.iterrows():
@@ -120,17 +200,7 @@ def compute_items(df: pd.DataFrame, vat_mode: str, default_vendor: str) -> pd.Da
         qty = _num(r.get("수량"))
         price = _num(r.get("단가"))
         ship = int(round(_num(r.get("배송비"))))
-        # 양식 기준: 배송비도 과세 대상 → 공급가액 = 수량×단가 + 배송비, 부가세 = 공급가액의 10%
-        # (예: 지출결의서 소계 418,000 → 부가세 41,800 / 완료기안 공급가액 418,000)
-        gross = int(round(qty * price)) + ship
-
-        if vat_mode == "exclusive":
-            supply, vat = gross, int(gross * 0.1)
-        elif vat_mode == "inclusive":
-            supply = int(round(gross / 1.1))
-            vat = gross - supply
-        else:
-            supply, vat = gross, 0
+        supply, vat = _amounts(qty, price, ship, vat_mode)
 
         rows.append({
             "순번": len(rows) + 1,
@@ -203,7 +273,7 @@ def build_body_text(info: dict, items: pd.DataFrame, totals: dict) -> str:
     notes = [vat_note]
     if totals["배송비"]:
         notes.append(f"배송비 {won(totals['배송비'])} 포함")
-    amount_line = f"金 {won(totals['합계'])} ({', '.join(notes)})"
+    amount_line = f"￦ {won(totals['합계'])} ({', '.join(notes)})"
 
     account_line = " ".join(x for x in [info["bank"], info["account"]] if x)
     if info["holder"]:
@@ -769,7 +839,7 @@ def save_history(df: pd.DataFrame) -> None:
 
 
 def make_history_record(info: dict, items: pd.DataFrame, totals: dict) -> dict:
-    vendors = list(dict.fromkeys(v for v in items["업체명"] if v)) or [info["vendor"]]
+    vendors = list(dict.fromkeys(v for v in items["업체명"] if v))
     squash = lambda t: " ".join(str(t).split())  # noqa: E731 — 줄바꿈·공백 차이는 같은 건으로 봄
     key = "|".join([f"{info['write_date']:%Y-%m-%d}", squash(info["subject"]), squash(",".join(vendors)),
                     str(totals["합계"]), squash(info["drafter"])])
@@ -796,30 +866,172 @@ def make_history_record(info: dict, items: pd.DataFrame, totals: dict) -> dict:
     }
 
 
-def record_issue(record: dict, kind: str) -> None:
-    """다운로드 버튼 콜백: 같은 건(발급ID)이면 갱신, 없으면 추가. kind = '지출결의서' / '완료기안'."""
+def record_issue(record: dict, kind: str | None = None) -> bool:
+    """같은 건(발급ID)이면 갱신, 없으면 추가. 성공하면 True.
+    kind = '지출결의서' / '완료기안' (다운로드 버튼 콜백 — 발급 일시 기록) / None ([저장 및 발급대장 등록])."""
     try:
         df = load_history()
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        stamp_col = f"{kind} 발급"
+        stamp_col = f"{kind} 발급" if kind else None
         hit = df.index[df["발급ID"] == record["발급ID"]]
         if len(hit):
             i = hit[0]
             for col, value in record.items():
                 if col.endswith(" 발급"):
                     continue
-                if col == "문서번호" and not value:  # 나중에 비워서 다시 받아도 기존 문서번호 유지
+                if col == "문서번호" and not value:  # 문서번호는 발급 대장에서 입력 → 비어 있으면 기존 값 유지
                     continue
                 df.at[i, col] = value
-            df.at[i, stamp_col] = now
+            if stamp_col:
+                df.at[i, stamp_col] = now
         else:
             row = dict(record)
-            row[stamp_col] = now
+            if stamp_col:
+                row[stamp_col] = now
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         save_history(df)
-        st.toast(f"발급 대장에 저장했습니다 ({kind} · {record['건명']})", icon="📒")
+        st.toast(f"발급 대장에 저장했습니다 ({kind or '등록'} · {record['건명']})", icon="📒")
+        return True
     except OSError as exc:  # 파일이 Excel에서 열려 있는 경우 등
         st.toast(f"발급 대장 저장 실패: {exc} — history.csv가 다른 프로그램에서 열려 있는지 확인하세요.", icon="⚠️")
+        return False
+
+
+def register_record(record: dict) -> None:
+    """[저장 및 발급대장 등록] 콜백: history.csv에 등록 → 불러온 임시저장본은 정리 → 발급 대장 탭으로 이동."""
+    if not record_issue(record):
+        return
+    draft_id = st.session_state.get("current_draft_id")
+    if draft_id:
+        try:
+            save_drafts([d for d in load_drafts() if d["id"] != draft_id])
+        except OSError:
+            pass  # 임시저장본 정리는 실패해도 등록 자체에는 영향 없음
+        st.session_state["current_draft_id"] = None
+    st.session_state["main_tab"] = TAB_LEDGER
+
+
+def history_doc_no(issue_id: str) -> str:
+    """발급 대장에 입력된 이 건의 문서번호 (없으면 '')."""
+    df = load_history()
+    hit = df.loc[df["발급ID"] == issue_id, "문서번호"]
+    return str(hit.iloc[0]).strip() if len(hit) else ""
+
+
+# ---------------------------------------------------------------------------
+# 임시저장 (drafts.json)
+# ---------------------------------------------------------------------------
+def load_drafts() -> list[dict]:
+    if not DRAFTS_PATH.exists():
+        return []
+    try:
+        data = json.loads(DRAFTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_drafts(drafts: list[dict]) -> None:
+    tmp = DRAFTS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(drafts, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DRAFTS_PATH)
+
+
+def save_draft() -> None:
+    """[임시저장] 콜백: 현재 입력값을 저장. 불러온 임시저장본을 수정 중이면 그 항목을 덮어씀."""
+    ss = st.session_state
+    form = {}
+    for key in form_defaults():
+        value = ss.get(key)
+        form[key] = value.isoformat() if isinstance(value, date) else value
+    items_df = ss.get("items_df", blank_items())
+    items = [{c: (None if isinstance(v, float) and math.isnan(v) else v) for c, v in r.items()}
+             for r in items_df[ITEM_COLUMNS].to_dict("records")]
+    filled = [r for r in items if _text(r["품목"])]
+    subject = _text(form["f_subject"]) or (
+        (filled[0]["품목"] + (f" 외 {len(filled) - 1}건" if len(filled) > 1 else "")) if filled else "(건명 없음)")
+    total = int(sum(_num(v) for v in items_df["합계"]))
+    draft = {"id": ss.get("current_draft_id") or datetime.now().strftime("%y%m%d%H%M%S%f"),
+             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "subject": subject, "total": total,
+             "item_count": len(filled), "form": form, "items": items}
+    try:
+        drafts = [d for d in load_drafts() if d["id"] != draft["id"]]
+        save_drafts([draft] + drafts)
+    except OSError as exc:
+        st.toast(f"임시저장 실패: {exc}", icon="⚠️")
+        return
+    ss["current_draft_id"] = draft["id"]
+    st.toast(f"임시저장했습니다 ({subject}) — [{TAB_DRAFTS}] 탭에서 다시 불러올 수 있습니다.", icon="💾")
+
+
+def _set_items(df: pd.DataFrame) -> None:
+    """내역 표 교체 → 표 위젯을 새 key로 다시 그림 (이전 편집 내용이 새 표에 겹치지 않도록)."""
+    st.session_state["items_df"] = df
+    st.session_state["items_ver"] = st.session_state.get("items_ver", 0) + 1
+
+
+def load_draft(draft_id: str) -> None:
+    """[불러오기] 콜백: 임시저장본을 입력 폼에 채우고 작성 탭으로 이동."""
+    ss = st.session_state
+    draft = next((d for d in load_drafts() if d["id"] == draft_id), None)
+    if draft is None:
+        st.toast("임시저장본을 찾을 수 없습니다.", icon="⚠️")
+        return
+    defaults = form_defaults()
+    for key, default in defaults.items():
+        value = draft["form"].get(key, default)
+        if key in FORM_DATE_KEYS:
+            try:
+                value = date.fromisoformat(value)
+            except (TypeError, ValueError):
+                value = default
+        ss[key] = value
+    bank = ss["f_bank"]
+    if bank and bank not in BANKS:  # 수기 입력한 은행 → 선택 목록에 추가
+        ss["custom_banks"] = list(dict.fromkeys(ss.get("custom_banks", []) + [bank]))
+    vat_mode = VAT_MODES.get(ss["f_vat"], "exclusive")
+    items = pd.DataFrame(draft.get("items") or [{}], columns=EDITOR_COLUMNS)
+    _set_items(normalize_items(items, vat_mode))
+    ss["current_draft_id"] = draft_id
+    ss["main_tab"] = TAB_WRITE
+    st.toast(f"임시저장본을 불러왔습니다 ({draft['subject']})", icon="📂")
+
+
+def delete_draft(draft_id: str) -> None:
+    try:
+        save_drafts([d for d in load_drafts() if d["id"] != draft_id])
+    except OSError as exc:
+        st.toast(f"삭제 실패: {exc}", icon="⚠️")
+        return
+    if st.session_state.get("current_draft_id") == draft_id:
+        st.session_state["current_draft_id"] = None
+    st.toast("임시저장본을 삭제했습니다.", icon="🗑️")
+
+
+def new_form() -> None:
+    """[새로 작성] 콜백: 입력 폼과 내역 표를 비움."""
+    for key, value in form_defaults().items():
+        st.session_state[key] = value
+    _set_items(blank_items())
+    st.session_state["current_draft_id"] = None
+
+
+def render_drafts() -> None:
+    st.header("💾 임시저장 목록")
+    st.caption(f"[임시저장]한 작성 중 문서입니다. [불러오기]를 누르면 작성 탭에서 이어서 수정할 수 있습니다. 저장 위치: `{DRAFTS_PATH}`")
+    drafts = load_drafts()
+    if not drafts:
+        st.info(f"임시저장된 문서가 없습니다. [{TAB_WRITE}] 탭에서 [💾 임시저장]을 누르면 여기에 쌓입니다.")
+        return
+    current = st.session_state.get("current_draft_id")
+    for d in drafts:
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([5, 1.2, 1.2], vertical_alignment="center")
+            editing = " · ✏️ 작성 중" if d["id"] == current else ""
+            c1.markdown(f"**{d['subject']}**{editing}")
+            c1.caption(f"저장 {d['saved_at']} · 품목 {d.get('item_count', 0)}건 · 합계 {int(d.get('total', 0)):,}원")
+            c2.button("📂 불러오기", key=f"draft_load_{d['id']}", on_click=load_draft, args=(d["id"],), width="stretch")
+            c3.button("🗑️ 삭제", key=f"draft_del_{d['id']}", on_click=delete_draft, args=(d["id"],), width="stretch")
 
 
 def build_history_excel(df: pd.DataFrame) -> bytes:
@@ -894,19 +1106,22 @@ def apply_ledger_edits(df: pd.DataFrame, original: pd.DataFrame, edited: pd.Data
 
 def render_ledger() -> None:
     st.header("📒 발급 대장")
-    st.caption(f"지출결의서·완료기안 엑셀을 다운로드할 때마다 자동으로 누적됩니다. 저장 위치: `{HISTORY_PATH}`")
+    st.caption("[저장 및 발급대장 등록]을 누르거나 지출결의서·완료기안 엑셀을 다운로드하면 자동으로 누적됩니다. "
+               f"저장 위치: `{HISTORY_PATH}`")
     df = load_history()
     if df.empty:
-        st.info("아직 발급 내역이 없습니다. [1. 지출결의서 작성] 탭에서 엑셀을 다운로드하면 여기에 쌓입니다.")
+        st.info(f"아직 발급 내역이 없습니다. [{TAB_WRITE}] 탭에서 [📒 저장 및 발급대장 등록]을 누르면 여기에 쌓입니다.")
         return
     status = history_status(df)
 
-    # ---- 단계별 요약 ----
-    m0, m1, m2, m3 = st.columns(4)
-    m0.metric("전체 건수", f"{len(df)}건", border=True)
-    m1.metric(STATUS_DRAFT, f"{int((status == STATUS_DRAFT).sum())}건", border=True)
-    m2.metric(STATUS_SUBMITTED, f"{int((status == STATUS_SUBMITTED).sum())}건", border=True)
-    m3.metric(STATUS_DONE, f"{int((status == STATUS_DONE).sum())}건", border=True)
+    # ---- 단계별 요약: 1·2단계는 진행 중인 건명까지, 3단계는 건수만 ----
+    for col, stage_label in zip(st.columns(3), (STATUS_DRAFT, STATUS_SUBMITTED, STATUS_DONE)):
+        in_stage = df[status == stage_label]
+        with col.container(border=True):
+            st.metric(stage_label, f"{len(in_stage)}건")
+            if stage_label != STATUS_DONE and len(in_stage):
+                names = ", ".join(with_gun(" ".join(s.split())) for s in in_stage["건명"] if s.strip())
+                st.caption(f"({names})")
 
     # ---- 필터 ----
     stage = st.radio("진행 단계", list(STATUS_FILTERS), horizontal=True, key="ledger_stage")
@@ -915,7 +1130,7 @@ def render_ledger() -> None:
     c1, c2, c3 = st.columns([2, 1.5, 1.5])
     period = c1.date_input("작성일 범위", value=(lo, hi), key="ledger_period")
     vendor_q = c2.text_input("지급처 검색", key="ledger_vendor", placeholder="예: 타라")
-    drafter_q = c3.text_input("기안자 검색", key="ledger_drafter", placeholder="예: 김세희")
+    subject_q = c3.text_input("건명 검색", key="ledger_subject", placeholder="예: 명함")
 
     mask = pd.Series(True, index=df.index)
     if STATUS_FILTERS[stage]:
@@ -924,15 +1139,17 @@ def render_ledger() -> None:
         mask &= dates.dt.date.between(period[0], period[1])
     if vendor_q.strip():
         mask &= df["지급처"].str.contains(vendor_q.strip(), case=False, regex=False)
-    if drafter_q.strip():
-        mask &= df["기안자"].str.contains(drafter_q.strip(), case=False, regex=False)
+    if subject_q.strip():
+        mask &= df["건명"].str.contains(subject_q.strip(), case=False, regex=False)
 
-    view = df[mask].assign(상태=status[mask], 승인완료=df.loc[mask, "승인완료"].eq("O"))
+    # 상태 열은 색 동그라미만 (🟡 / 🔵 / 🟢)
+    view = df[mask].assign(상태=status[mask].str[0], 승인완료=df.loc[mask, "승인완료"].eq("O"))
     view = view.sort_values(["작성일", "지출결의서 발급"], ascending=False).set_index("발급ID")
     view = view[LEDGER_VIEW_COLUMNS]
 
     st.caption(f"검색 결과 **{len(view)}건** · 합계 **{int(view['합계'].sum()):,}원** (전체 {len(df)}건) — "
                "표에서 **문서번호**를 입력하거나 **승인완료**를 체크하면 바로 저장됩니다.")
+    st.caption(STATUS_LEGEND)
     # 저장 후에는 새 key로 표를 다시 그려, 필터·정렬이 바뀐 뒤 이전 편집 내용이 다른 행에 붙지 않게 함
     version = st.session_state.setdefault("ledger_editor_version", 0)
     edited = st.data_editor(
@@ -942,7 +1159,8 @@ def render_ledger() -> None:
         width="stretch",
         disabled=[c for c in LEDGER_VIEW_COLUMNS if c not in ("문서번호", "승인완료")],
         column_config={
-            "상태": st.column_config.TextColumn("상태", width="medium"),
+            "상태": st.column_config.TextColumn("상태", width="small", help=STATUS_LEGEND),
+            "건명": st.column_config.TextColumn("건명", width="medium"),
             "승인완료": st.column_config.CheckboxColumn("승인완료", help="회장님 최종 결재·승인이 끝나면 체크"),
             "문서번호": st.column_config.TextColumn("문서번호", help="그룹웨어 상신 후 받은 문서번호",
                                                    width="medium"),
@@ -1036,13 +1254,6 @@ def synced_text(label: str, generated: str, key: str, height: int | None = None)
     return st.text_area(label, key=key, height=height)
 
 
-def default_items() -> pd.DataFrame:
-    return pd.DataFrame(
-        [{"품목": "명함 제작", "업체명": "", "수량": 200, "단가": 100, "배송비": 3000, "비고": ""}],
-        columns=ITEM_COLUMNS,
-    )
-
-
 # ---------------------------------------------------------------------------
 # 앱
 # ---------------------------------------------------------------------------
@@ -1058,6 +1269,7 @@ def render_sidebar() -> dict:
             "company": st.text_input("회사", "GSI").strip(),
             "site": st.text_input("사업장", "본사").strip(),
             "dept": st.text_input("부서", "인사총무팀").strip(),
+            "drafter": st.text_input("기안자", "김세희 사원").strip(),
         }
         st.divider()
         st.subheader("문자 보고")
@@ -1076,87 +1288,123 @@ def render_sidebar() -> dict:
     return settings
 
 
-def render_writer(settings: dict) -> None:
-    # ---- 기능 1: 입력 ----
-    st.header("1️⃣ 지출결의서 입력")
+def render_items_editor(vat_mode: str) -> pd.DataFrame:
+    """내역 통합 표 1개: 입력 칸(품목·업체명·수량·단가·배송비·비고) + 자동 계산 칸(순번·공급가액·부가세·합계).
 
-    c1, c2, c3, c4 = st.columns(4)
-    write_date = c1.date_input("작성일", date.today())
-    drafter = c2.text_input("기안자", "김세희 사원")
-    requester = c3.text_input("요청자 (비우면 기안자)", "")
-    payer = c4.selectbox("출금회사", ["GSI", "KN"])
-
-    c1, c2, c3, c4 = st.columns(4)
-    doc_no = c1.text_input("문서번호", "", placeholder="결재 완료 후 입력")
-    pay_method = c2.selectbox("결제방법", PAY_METHODS)
-    evidence = c3.selectbox("증빙구분", EVIDENCE_TYPES)
-
-    c1, c2, c3, c4 = st.columns(4)
-    vendor = c1.text_input("지급처(업체명)", "", placeholder="예: OO인쇄")
-    bank = c2.text_input("은행", "", placeholder="예: 국민은행")
-    account = c3.text_input("계좌번호", "", placeholder="예: 123-456-7890")
-    holder = c4.text_input("예금주", "")
-
-    c1, c2, c3, c4 = st.columns(4)
-    pay_date = c1.date_input("입금요청일", date.today())
-    urgent = c2.checkbox("긴급건", False)
-    vat_label = c3.selectbox("부가세", list(VAT_MODES))
-    subject_override = c4.text_input("건명 (비우면 자동)", "", placeholder="예: 명함 제작")
-
-    st.subheader("내역")
-    st.caption("표 하단의 ➕ 로 행 추가, 행 선택 후 🗑️ 로 삭제. 업체명을 비우면 위의 지급처가 사용됩니다.")
-    if "items_df" not in st.session_state:
-        st.session_state.items_df = default_items()
+    편집할 때마다 계산 칸을 다시 채운 표로 교체하고, 표 위젯은 새 key로 다시 그림
+    (같은 key로 데이터만 바꾸면 이전 편집 내용이 행 추가·삭제 후 엉뚱한 행에 다시 적용됨).
+    """
+    ss = st.session_state
+    if "items_df" not in ss:
+        ss["items_df"] = blank_items()
+    current = normalize_items(ss["items_df"], vat_mode)
+    if not current.equals(ss["items_df"]):  # 부가세 방식이 바뀐 경우
+        _set_items(current)
+    money = lambda label: st.column_config.NumberColumn(label, format="localized", disabled=True)  # noqa: E731
     edited = st.data_editor(
-        st.session_state.items_df,
-        key="items_editor",
-        num_rows="dynamic",
+        ss["items_df"],
+        key=f"items_editor_{ss.setdefault('items_ver', 0)}",
+        num_rows="fixed",
         width="stretch",
         hide_index=True,
+        column_order=EDITOR_COLUMNS,
         column_config={
-            "품목": st.column_config.TextColumn("품목(사유)", required=True, width="large"),
+            "선택": st.column_config.CheckboxColumn("선택", help="삭제할 행을 체크한 뒤 [🗑️ 선택 행 삭제]", width="small"),
+            "순번": st.column_config.NumberColumn("순번", format="%d", disabled=True, width="small"),
+            "품목": st.column_config.TextColumn("품목", width="large"),
             "업체명": st.column_config.TextColumn("업체명"),
-            "수량": st.column_config.NumberColumn("수량", min_value=0, step=1, default=1),
-            "단가": st.column_config.NumberColumn("단가", min_value=0, step=1, format="%d", default=0),
-            "배송비": st.column_config.NumberColumn("배송비", min_value=0, step=1, format="%d", default=0),
+            "수량": st.column_config.NumberColumn("수량", min_value=0, step=1, format="localized"),
+            "단가": st.column_config.NumberColumn("단가", min_value=0, step=1, format="localized"),
+            "공급가액": money("공급가액"),
+            "부가세": money("부가세"),
+            "배송비": st.column_config.NumberColumn("배송비", min_value=0, step=1, format="localized"),
+            "합계": money("합계"),
             "비고": st.column_config.TextColumn("비고"),
         },
     )
+    updated = normalize_items(edited, vat_mode)
+    if not updated.equals(ss["items_df"]):
+        _set_items(updated)
+        st.rerun()
+
+    selected = int(ss["items_df"]["선택"].sum())
+    c1, c2, _ = st.columns([1, 1, 3])
+    c1.button("➕ 행 추가", key="items_add", width="stretch",
+              on_click=lambda: _set_items(pd.concat([ss["items_df"], blank_items()], ignore_index=True)))
+    c2.button(f"🗑️ 선택 행 삭제 ({selected})", key="items_delete", width="stretch", disabled=not selected,
+              on_click=lambda: _set_items(normalize_items(
+                  ss["items_df"][~ss["items_df"]["선택"]].pipe(lambda d: d if len(d) else blank_items()), vat_mode)))
+    return ss["items_df"]
+
+
+def render_writer(settings: dict) -> None:
+    # ---- 기능 1: 입력 ----
+    ss = st.session_state
+    for key, value in form_defaults().items():  # 처음 한 번만 빈 값으로 시작 (샘플 데이터 없음)
+        ss.setdefault(key, value)
+    st.header("1️⃣ 지출결의서 입력")
+    if ss.get("current_draft_id"):
+        st.caption("✏️ 임시저장본을 불러와 수정 중입니다. [💾 임시저장]을 누르면 같은 항목에 덮어씁니다.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.date_input("작성일", key="f_write_date")
+    c2.date_input("입금요청일", key="f_pay_date")
+    c3.selectbox("출금회사", ["GSI", "KN"], key="f_payer")
+    c4.checkbox("긴급건", key="f_urgent")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.selectbox("결제방법", PAY_METHODS, key="f_pay_method")
+    c2.selectbox("증빙구분", EVIDENCE_TYPES, key="f_evidence", help="'-' = 선택 안 함")
+    c3.selectbox("부가세", list(VAT_MODES), key="f_vat")
+    c4.text_input("건명 (비우면 자동)", key="f_subject", placeholder="예: 명함 제작")
 
     c1, c2, c3 = st.columns(3)
-    reason = c1.text_area("사유", "업무 수행에 필요한 물품 구매", height=90)
-    attachment = c2.text_area("첨부", "가. 견적서 1부.\n나. 통장사본 1부.", height=90)
-    remark = c3.text_area("특이사항", "없음", height=90)
+    c1.selectbox("은행", BANKS + [b for b in ss.get("custom_banks", []) if b not in BANKS], key="f_bank",
+                 index=None, accept_new_options=True, placeholder="선택 또는 직접 입력")
+    c2.text_input("계좌번호", key="f_account", placeholder="예: 123-456-7890")
+    c3.text_input("예금주", key="f_holder")
 
-    vat_mode = VAT_MODES[vat_label]
-    items = compute_items(edited, vat_mode, vendor)
+    st.subheader("내역")
+    st.caption("품목·업체명·수량·단가·배송비·비고를 입력하면 순번·공급가액·부가세·합계가 자동 계산됩니다. "
+               "공급가액 = 수량 × 단가 + 배송비 (배송비도 부가세 과세 — 기존 지출결의서·완료기안 양식 기준)")
+    vat_mode = VAT_MODES[ss["f_vat"]]
+    items_df = render_items_editor(vat_mode)
+
+    reason = st.text_area("사유", key="f_reason", height=90, placeholder="예: 업무 수행에 필요한 물품 구매")
+    attachment = st.text_area("첨부", key="f_attachment", height=90, placeholder="예: 가. 견적서 1부.\n나. 통장사본 1부.")
+    remark = st.text_area("특이사항", key="f_remark", height=90, placeholder="없으면 비워 두세요")
+
+    items = compute_items(items_df, vat_mode)
     totals = {k: int(items[k].sum()) if not items.empty else 0 for k in ["공급가액", "부가세", "배송비", "합계"]}
+    write_date, pay_date, drafter = ss["f_write_date"], ss["f_pay_date"], settings["drafter"]
+    info = {
+        "write_date": write_date, "drafter": drafter, "doc_no": "", "payer": ss["f_payer"],
+        "requester": drafter, "pay_method": ss["f_pay_method"], "evidence": ss["f_evidence"],
+        "bank": _text(ss["f_bank"]), "account": ss["f_account"].strip(), "holder": ss["f_holder"].strip(),
+        "pay_date": pay_date, "urgent": ss["f_urgent"], "vat_mode": vat_mode, "unit": settings["unit"],
+        "subject": item_summary(items, ss["f_subject"].strip()),
+        "reason": reason.strip(), "attachment": attachment.strip(), "remark": remark.strip(),
+        "company": settings["company"], "site": settings["site"], "dept": settings["dept"],
+        "sms_to": settings["sms_to"], "sms_from": settings["sms_from"],
+    }
+    record = make_history_record(info, items, totals) if not items.empty else None
+
+    # ---- 임시저장 / 발급대장 등록 ----
+    c1, c2, c3 = st.columns(3)
+    c1.button("💾 임시저장", key="btn_draft", width="stretch", on_click=save_draft)
+    c2.button("📒 저장 및 발급대장 등록", key="btn_register", type="primary", width="stretch",
+              disabled=record is None, on_click=register_record, args=(record,),
+              help="history.csv에 등록하고 [2. 발급 대장] 탭으로 이동합니다.")
+    c3.button("🆕 새로 작성", key="btn_new", width="stretch", on_click=new_form,
+              help="입력 내용을 모두 비웁니다 (임시저장본은 그대로 남음).")
 
     if items.empty:
         st.info("내역에 품목을 1개 이상 입력하세요.")
         return
 
-    st.dataframe(
-        items.style.format({
-            "수량": qty_str, "단가": "{:,.0f}", "공급가액": "{:,.0f}",
-            "부가세": "{:,.0f}", "배송비": "{:,.0f}", "합계": "{:,.0f}",
-        }),
-        width="stretch",
-        hide_index=True,
-    )
-    st.caption("공급가액 = 수량 × 단가 + 배송비 (배송비도 부가세 과세 — 기존 지출결의서·완료기안 양식 기준)")
-
-    info = {
-        "write_date": write_date, "drafter": drafter.strip(), "doc_no": doc_no.strip(), "payer": payer,
-        "requester": requester.strip() or drafter.strip(), "pay_method": pay_method, "evidence": evidence,
-        "vendor": vendor.strip(), "bank": bank.strip(), "account": account.strip(), "holder": holder.strip(),
-        "pay_date": pay_date, "urgent": urgent, "vat_mode": vat_mode, "unit": settings["unit"],
-        "subject": item_summary(items, subject_override.strip()),
-        "reason": reason.strip(), "attachment": attachment.strip(), "remark": remark.strip(),
-        "company": settings["company"], "site": settings["site"], "dept": settings["dept"],
-        "sms_to": settings["sms_to"], "sms_from": settings["sms_from"],
-    }
-    record = make_history_record(info, items, totals)
+    # 문서번호는 발급 대장에서 입력 → 같은 건이 대장에 있으면 그 문서번호를 완료기안에 사용
+    doc_no = history_doc_no(record["발급ID"])
+    info["doc_no"] = record["문서번호"] = doc_no
     xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     st.divider()
@@ -1233,7 +1481,7 @@ def render_writer(settings: dict) -> None:
         st.error(f"완료기안 템플릿 오류: {exc}")
         return
     if not doc_no:
-        st.warning("문서번호가 비어 있습니다. 결재 완료 후 문서번호를 입력하면 엑셀에 반영됩니다.")
+        st.warning(f"문서번호가 비어 있습니다. 상신 후 [{TAB_LEDGER}] 탭에서 이 건의 문서번호를 입력하면 엑셀에 반영됩니다.")
     st.download_button(
         f"⬇️ {done_name} 다운로드",
         data=build_excel(done_bytes, info, items, totals),
@@ -1249,16 +1497,19 @@ def render_writer(settings: dict) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="지출결의 자동화", page_icon="🧾", layout="wide")
-    st.title("🧾 지출결의 업무 자동화")
+    st.set_page_config(page_title="지출결의 업무", page_icon="🧾", layout="wide")
+    st.title("🧾 지출결의 업무")
     st.caption("지출결의서 내역을 입력하면 품의 문구 · 문서 제목 · 지출결의서/완료기안 엑셀 · 문자 보고 템플릿을 자동 생성하고, "
                "발급 내역을 대장으로 관리합니다.")
     settings = render_sidebar()
-    tab_write, tab_ledger = st.tabs(["1. 지출결의서 작성", "2. 발급 대장"])
+    # key로 선택 탭을 기억 → [저장 및 발급대장 등록] / [불러오기] 콜백이 session_state로 탭을 바꿈
+    tab_write, tab_ledger, tab_drafts = st.tabs([TAB_WRITE, TAB_LEDGER, TAB_DRAFTS], key="main_tab", on_change="rerun")
     with tab_write:
         render_writer(settings)
     with tab_ledger:
         render_ledger()
+    with tab_drafts:
+        render_drafts()
 
 
 if __name__ == "__main__":
