@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import zipfile
 from copy import copy
 from datetime import date, datetime
 from io import BytesIO
@@ -91,7 +92,7 @@ def form_defaults() -> dict:
     return {
         "f_write_date": today, "f_pay_date": today, "f_payer": "GSI", "f_urgent": False,
         "f_pay_method": PAY_METHODS[0], "f_evidence": EVIDENCE_TYPES[0], "f_vat": list(VAT_MODES)[0],
-        "f_subject": "", "f_bank": None, "f_account": "", "f_holder": "",
+        "f_bank": None, "f_account": "", "f_holder": "",
         "f_reason": "", "f_attachment": "", "f_remark": "",
     }
 
@@ -100,7 +101,7 @@ def form_defaults() -> dict:
 DRAFTS_PATH = Path(os.environ.get("JICHUL_DRAFTS_PATH") or APP_DIR / "drafts.json")
 
 # ---- 탭 ----
-TAB_WRITE, TAB_LEDGER, TAB_DRAFTS = "1. 지출결의서 작성", "2. 발급 대장", "3. 임시저장 목록"
+TAB_WRITE, TAB_LEDGER, TAB_DRAFTS, TAB_BACKUP = "1. 지출결의서 작성", "2. 발급 대장", "3. 임시저장 목록", "4. 백업"
 
 # ---- 발급 대장 ----
 HISTORY_PATH = Path(os.environ.get("JICHUL_HISTORY_PATH") or APP_DIR / "history.csv")  # 환경변수로 위치 변경 가능
@@ -116,6 +117,11 @@ STATUS_LEGEND = "🟡 기안 작성 중 (문서번호 미입력) · 🔵 상신 
 LEDGER_VIEW_COLUMNS = ["상태", "건명", "작성일", "문서번호", "승인완료", "지급처", "합계", "공급가액", "부가세",
                        "품목수", "기안자", "출금회사", "입금요청일", "긴급", "은행", "계좌번호", "예금주", "기안부서",
                        "지출결의서 발급", "완료기안 발급", "승인일시"]
+
+# ---- 백업: history.csv + drafts.json을 zip으로 묶어 backups 폴더에 보관 ----
+BACKUP_DIR = Path(os.environ.get("JICHUL_BACKUP_DIR") or APP_DIR / "backups")
+BACKUP_KEEP = 60  # 자동 백업은 최근 60개만 보관 (수동·복원/삭제 직전 백업은 지우지 않음)
+BACKUP_KINDS = {"auto": "자동(하루 1회)", "manual": "수동", "before-restore": "복원 직전", "before-delete": "삭제 직전"}
 
 
 # ---------------------------------------------------------------------------
@@ -227,18 +233,17 @@ def qty_str(q: float) -> str:
     return f"{int(q):,}" if float(q).is_integer() else f"{q:,}"
 
 
-def item_summary(items: pd.DataFrame, subject: str) -> str:
-    """'명함 제작' / '명함 제작 외 2건' 형식."""
-    if subject:
-        return subject
-    if items.empty:
+def item_summary(items: pd.DataFrame) -> str:
+    """건명 = 내역 첫 번째 행의 품목 (내역이 없으면 빈 문자열)."""
+    if items.empty or "품목" not in items.columns:
         return ""
-    first = items.iloc[0]["품목"]
-    return first if len(items) == 1 else f"{first} 외 {len(items) - 1}건"
+    return _text(items.iloc[0]["품목"])
 
 
 def with_gun(subject: str) -> str:
     """'명함 제작' → '명함 제작 건', 이미 '건'으로 끝나면 그대로."""
+    if not subject:
+        return ""
     return subject if subject.endswith("건") else f"{subject} 건"
 
 
@@ -771,12 +776,12 @@ def html_preview(doc_html: str, height: int) -> None:
     st.iframe(
         f"""
         <div style="position:sticky;top:0;z-index:1;background:#fff;padding:6px 0 10px;">
-          <button id="copy-html" style="
+          <button id="copy-html" onmouseover="this.style.background='#7A895F';this.style.borderColor='#7A895F'" onmouseout="this.style.background='#8B9A6E';this.style.borderColor='#8B9A6E'" style="
               width:100%;padding:0.55rem 0.75rem;border-radius:0.5rem;cursor:pointer;
-              border:1px solid rgba(49,51,63,0.2);background:#ff4b4b;color:#fff;
+              border:1px solid #8B9A6E;background:#8B9A6E;color:#fff;font-weight:600;
               font-size:0.95rem;font-family:sans-serif;">📋 HTML 복사하기</button>
         </div>
-        <div id="doc" style="background:#fff;padding:12px;border:1px solid #e0e0e0;">{doc_html}</div>
+        <div id="doc" style="background:#fff;padding:12px;border:1px solid #E0E0E0;">{doc_html}</div>
         <script>
         const html = {payload};
         const btn = document.getElementById("copy-html");
@@ -948,8 +953,7 @@ def save_draft() -> None:
     items = [{c: (None if isinstance(v, float) and math.isnan(v) else v) for c, v in r.items()}
              for r in items_df[ITEM_COLUMNS].to_dict("records")]
     filled = [r for r in items if _text(r["품목"])]
-    subject = _text(form["f_subject"]) or (
-        (filled[0]["품목"] + (f" 외 {len(filled) - 1}건" if len(filled) > 1 else "")) if filled else "(건명 없음)")
+    subject = _text(filled[0]["품목"]) if filled else "(품목 없음)"
     total = int(sum(_num(v) for v in items_df["합계"]))
     draft = {"id": ss.get("current_draft_id") or datetime.now().strftime("%y%m%d%H%M%S%f"),
              "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "subject": subject, "total": total,
@@ -1030,7 +1034,7 @@ def render_drafts() -> None:
             editing = " · ✏️ 작성 중" if d["id"] == current else ""
             c1.markdown(f"**{d['subject']}**{editing}")
             c1.caption(f"저장 {d['saved_at']} · 품목 {d.get('item_count', 0)}건 · 합계 {int(d.get('total', 0)):,}원")
-            c2.button("📂 불러오기", key=f"draft_load_{d['id']}", on_click=load_draft, args=(d["id"],), width="stretch")
+            c2.button("📂 불러오기", key=f"draft_load_{d['id']}", type="primary", on_click=load_draft, args=(d["id"],), width="stretch")
             c3.button("🗑️ 삭제", key=f"draft_del_{d['id']}", on_click=delete_draft, args=(d["id"],), width="stretch")
 
 
@@ -1193,10 +1197,193 @@ def render_ledger() -> None:
                   for r in df.to_dict("records")}
         to_delete = st.multiselect("삭제할 내역", list(labels), format_func=labels.get, key="ledger_delete")
         if st.button("선택 내역 삭제", disabled=not to_delete, key="ledger_delete_btn"):
+            try:
+                make_backup("before-delete")
+            except OSError:
+                pass  # 백업이 안 돼도 삭제는 진행 (하루 1회 자동 백업이 있음)
             save_history(df[~df["발급ID"].isin(to_delete)])
             st.session_state["ledger_editor_version"] = version + 1
             st.toast(f"{len(to_delete)}건을 삭제했습니다.", icon="🗑️")
             st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 백업 (backups/*.zip)
+# ---------------------------------------------------------------------------
+def backup_sources() -> dict[str, Path]:
+    """zip 안의 이름 → 실제 파일 경로."""
+    return {HISTORY_PATH.name: HISTORY_PATH, DRAFTS_PATH.name: DRAFTS_PATH}
+
+
+def backup_bytes() -> bytes:
+    """현재 데이터 파일(있는 것만)을 zip으로."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, path in backup_sources().items():
+            if path.exists():
+                zf.write(path, name)
+    return buf.getvalue()
+
+
+def make_backup(kind: str) -> Path | None:
+    """backups 폴더에 'YYMMDD_HHMMSS_종류.zip' 저장. 백업할 파일이 없으면 None."""
+    if not any(p.exists() for p in backup_sources().values()):
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    path = BACKUP_DIR / f"{datetime.now():%y%m%d_%H%M%S}_{kind}.zip"
+    path.write_bytes(backup_bytes())
+    for old in sorted(BACKUP_DIR.glob("*_auto.zip"))[:-BACKUP_KEEP]:
+        old.unlink(missing_ok=True)
+    return path
+
+
+def daily_backup() -> None:
+    """오늘 자동 백업이 없으면 하나 만듦 (앱을 열 때 호출)."""
+    if st.session_state.get("daily_backup_done"):
+        return
+    try:
+        if not list(BACKUP_DIR.glob(f"{date.today():%y%m%d}_*_auto.zip")):
+            make_backup("auto")
+    except OSError as exc:
+        st.toast(f"자동 백업 실패: {exc}", icon="⚠️")
+    st.session_state["daily_backup_done"] = True
+
+
+def list_backups() -> list[Path]:
+    return sorted(BACKUP_DIR.glob("*.zip"), reverse=True) if BACKUP_DIR.exists() else []
+
+
+def backup_summary(data: bytes) -> str:
+    """zip 안의 대장 건수·임시저장 건수 요약."""
+    parts = []
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        names = zf.namelist()
+        if HISTORY_PATH.name in names:
+            df = pd.read_csv(BytesIO(zf.read(HISTORY_PATH.name)), dtype=str, keep_default_na=False, encoding="utf-8-sig")
+            parts.append(f"발급 대장 {len(df)}건")
+        if DRAFTS_PATH.name in names:
+            drafts = json.loads(zf.read(DRAFTS_PATH.name).decode("utf-8"))
+            parts.append(f"임시저장 {len(drafts) if isinstance(drafts, list) else 0}건")
+    return " · ".join(parts) or "빈 백업"
+
+
+def restore_backup(data: bytes) -> None:
+    """zip의 데이터 파일로 교체. 교체 전에 현재 상태를 'before-restore'로 백업."""
+    sources = backup_sources()
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        files = {n: zf.read(n) for n in zf.namelist() if n in sources}
+    if not files:
+        raise ValueError(f"백업 파일에 {' / '.join(sources)}이(가) 없습니다.")
+    if HISTORY_PATH.name in files:  # 읽을 수 있는 파일인지 먼저 확인
+        pd.read_csv(BytesIO(files[HISTORY_PATH.name]), dtype=str, encoding="utf-8-sig")
+    if DRAFTS_PATH.name in files:
+        json.loads(files[DRAFTS_PATH.name].decode("utf-8"))
+    make_backup("before-restore")
+    for name, content in files.items():
+        path = sources[name]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(content)
+        tmp.replace(path)
+    st.session_state["ledger_editor_version"] = st.session_state.get("ledger_editor_version", 0) + 1
+
+
+def _backup_label(path: Path) -> str:
+    stem = path.stem.split("_", 2)
+    try:
+        when = datetime.strptime(f"{stem[0]}_{stem[1]}", "%y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, IndexError):
+        return path.name
+    kind = stem[2] if len(stem) > 2 else ""
+    return f"{when} · {BACKUP_KINDS.get(kind, kind)}"
+
+
+def _do_restore(data: bytes, label: str) -> None:
+    """[복원] 콜백."""
+    try:
+        restore_backup(data)
+    except (OSError, ValueError, zipfile.BadZipFile, pd.errors.ParserError) as exc:
+        st.toast(f"복원 실패: {exc} — history.csv가 Excel 등에서 열려 있으면 닫고 다시 시도하세요.", icon="⚠️")
+        return
+    st.toast(f"복원했습니다 ({label}). 복원 직전 상태도 백업해 두었습니다.", icon="♻️")
+
+
+def _manual_backup() -> None:
+    """[지금 백업] 콜백."""
+    try:
+        path = make_backup("manual")
+    except OSError as exc:
+        st.toast(f"백업 실패: {exc}", icon="⚠️")
+        return
+    if path:
+        st.toast(f"백업했습니다: {path.name}", icon="🗄️")
+    else:
+        st.toast("백업할 데이터가 아직 없습니다.", icon="ℹ️")
+
+
+def render_backup() -> None:
+    st.header("🗄️ 백업")
+    st.caption("발급 대장(`history.csv`)과 임시저장(`drafts.json`)을 zip으로 묶어 보관합니다. "
+               "앱을 여는 날마다 자동으로 1회 백업하고, 복원·발급 내역 삭제 직전에도 자동 백업합니다. "
+               f"저장 위치: `{BACKUP_DIR}`")
+
+    # ---- 현재 데이터 ----
+    for col, (label, path) in zip(st.columns(2), (("발급 대장", HISTORY_PATH), ("임시저장", DRAFTS_PATH))):
+        with col.container(border=True):
+            if path.exists():
+                count = len(load_history()) if path == HISTORY_PATH else len(load_drafts())
+                st.metric(f"현재 {label}", f"{count}건")
+                st.caption(f"마지막 수정 {datetime.fromtimestamp(path.stat().st_mtime):%Y-%m-%d %H:%M}")
+            else:
+                st.metric(f"현재 {label}", "없음")
+
+    c1, c2 = st.columns(2)
+    c1.button("🗄️ 지금 백업", type="primary", width="stretch", on_click=_manual_backup, key="backup_now")
+    c2.download_button("⬇️ 현재 데이터 zip 다운로드", data=backup_bytes(),
+                       file_name=f"지출결의_백업_{datetime.now():%y%m%d_%H%M}.zip", mime="application/zip",
+                       width="stretch", key="backup_download", on_click="ignore")
+    st.caption("PC 고장에 대비해 가끔은 zip을 내려받아 USB·메일·클라우드 등 다른 곳에도 보관하세요.")
+
+    # ---- 백업 목록 ----
+    st.subheader("백업 목록")
+    backups = list_backups()
+    if not backups:
+        st.info("아직 백업이 없습니다. [🗄️ 지금 백업]을 누르면 여기에 쌓입니다.")
+    for path in backups[:30]:
+        label = _backup_label(path)
+        try:
+            data = path.read_bytes()
+            summary = backup_summary(data)
+        except (OSError, ValueError, zipfile.BadZipFile, pd.errors.ParserError):
+            data, summary = None, "⚠️ 읽을 수 없는 파일"
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([5, 1.2, 1.2], vertical_alignment="center")
+            c1.markdown(f"**{label}**")
+            c1.caption(f"{summary} · `{path.name}`")
+            if data is None:
+                continue
+            c2.download_button("⬇️ 받기", data=data, file_name=path.name, mime="application/zip",
+                               key=f"backup_dl_{path.name}", width="stretch", on_click="ignore")
+            with c3.popover("♻️ 복원", width="stretch"):
+                st.warning(f"현재 데이터를 **{label}** 시점({summary})으로 되돌립니다. "
+                           "지금 상태는 복원 직전에 자동 백업됩니다.")
+                st.button("복원 실행", key=f"backup_restore_{path.name}", type="primary",
+                          on_click=_do_restore, args=(data, label))
+    if len(backups) > 30:
+        st.caption(f"최근 30개만 표시합니다 (전체 {len(backups)}개 — `{BACKUP_DIR}` 폴더에서 확인).")
+
+    # ---- 내려받은 zip으로 복원 ----
+    with st.expander("📤 내려받은 zip 파일로 복원"):
+        up = st.file_uploader("백업 zip 파일", type="zip", key="backup_upload")
+        if up is not None:
+            data = up.getvalue()
+            try:
+                st.caption(f"내용: {backup_summary(data)}")
+                ok = True
+            except (ValueError, zipfile.BadZipFile, pd.errors.ParserError) as exc:
+                st.error(f"백업 파일을 읽을 수 없습니다: {exc}")
+                ok = False
+            st.button("이 파일로 복원", key="backup_restore_upload", type="primary", disabled=not ok,
+                      on_click=_do_restore, args=(data, up.name))
 
 
 # ---------------------------------------------------------------------------
@@ -1207,9 +1394,9 @@ def copy_button(text: str, label: str, key: str) -> None:
     payload = json.dumps(text)
     st.iframe(
         f"""
-        <button id="btn-{key}" style="
+        <button id="btn-{key}" onmouseover="this.style.background='#7A895F';this.style.borderColor='#7A895F'" onmouseout="this.style.background='#8B9A6E';this.style.borderColor='#8B9A6E'" style="
             width:100%;padding:0.5rem 0.75rem;border-radius:0.5rem;cursor:pointer;
-            border:1px solid rgba(49,51,63,0.2);background:#ff4b4b;color:#fff;
+            border:1px solid #8B9A6E;background:#8B9A6E;color:#fff;font-weight:600;
             font-size:0.95rem;font-family:sans-serif;">📋 {html.escape(label)}</button>
         <script>
         const btn = document.getElementById("btn-{key}");
@@ -1352,11 +1539,10 @@ def render_writer(settings: dict) -> None:
     c3.selectbox("출금회사", ["GSI", "KN"], key="f_payer")
     c4.checkbox("긴급건", key="f_urgent")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.selectbox("결제방법", PAY_METHODS, key="f_pay_method")
     c2.selectbox("증빙구분", EVIDENCE_TYPES, key="f_evidence", help="'-' = 선택 안 함")
     c3.selectbox("부가세", list(VAT_MODES), key="f_vat")
-    c4.text_input("건명 (비우면 자동)", key="f_subject", placeholder="예: 명함 제작")
 
     c1, c2, c3 = st.columns(3)
     c1.selectbox("은행", BANKS + [b for b in ss.get("custom_banks", []) if b not in BANKS], key="f_bank",
@@ -1382,7 +1568,7 @@ def render_writer(settings: dict) -> None:
         "requester": drafter, "pay_method": ss["f_pay_method"], "evidence": ss["f_evidence"],
         "bank": _text(ss["f_bank"]), "account": ss["f_account"].strip(), "holder": ss["f_holder"].strip(),
         "pay_date": pay_date, "urgent": ss["f_urgent"], "vat_mode": vat_mode, "unit": settings["unit"],
-        "subject": item_summary(items, ss["f_subject"].strip()),
+        "subject": item_summary(items),
         "reason": reason.strip(), "attachment": attachment.strip(), "remark": remark.strip(),
         "company": settings["company"], "site": settings["site"], "dept": settings["dept"],
         "sms_to": settings["sms_to"], "sms_from": settings["sms_from"],
@@ -1496,20 +1682,103 @@ def render_writer(settings: dict) -> None:
     st.caption(f"템플릿: `{done_template.name}` → [{DONE_SHEET}] 시트")
 
 
+# 브랜드 컬러: 올리브 그린 포인트 + 라이트 그레이 보조
+THEME_GREEN, THEME_GREEN_DARK, THEME_BEIGE = "#8B9A6E", "#7A895F", "#EEEEEE"  # Primary / 호버 / 보조 배경
+THEME_BORDER, THEME_GREEN_BG, THEME_GREEN_TEXT = "#E0E0E0", "#F2F4EE", "#4A5638"  # 테두리 / 안내 상자 배경·글자
+THEME_GREEN_INK = "#5E6B47"  # 흰 배경 위 글자용 (Primary는 글자로 쓰기엔 연해서 한 톤 진하게)
+
+
+def apply_theme_css() -> None:
+    """올리브 그린/라이트 그레이 톤앤매너 CSS — .streamlit/config.toml을 못 읽는 실행 위치에서도 동일하게 적용."""
+    st.html(f"""
+    <style>
+    /* Primary 버튼 (일반·다운로드·폼 제출) */
+    button[data-testid="stBaseButton-primary"],
+    button[data-testid="stBaseButton-primaryFormSubmit"] {{
+        background-color: {THEME_GREEN} !important; border-color: {THEME_GREEN} !important; color: #fff !important;
+    }}
+    button[data-testid="stBaseButton-primary"] p,
+    button[data-testid="stBaseButton-primaryFormSubmit"] p {{ color: #fff !important; font-weight: 600; }}
+    button[data-testid="stBaseButton-primary"]:hover:not(:disabled),
+    button[data-testid="stBaseButton-primaryFormSubmit"]:hover:not(:disabled),
+    button[data-testid="stBaseButton-primary"]:active:not(:disabled) {{
+        background-color: {THEME_GREEN_DARK} !important; border-color: {THEME_GREEN_DARK} !important; color: #fff !important;
+    }}
+    button[data-testid="stBaseButton-primary"]:focus:not(:active) {{
+        border-color: {THEME_GREEN_DARK}; box-shadow: 0 0 0 0.2rem {THEME_GREEN}55;
+    }}
+    /* Secondary 버튼: 호버·포커스 시 올리브 */
+    button[data-testid="stBaseButton-secondary"]:hover:not(:disabled),
+    button[data-testid="stBaseButton-secondary"]:focus:not(:active) {{
+        border-color: {THEME_GREEN}; color: {THEME_GREEN_INK};
+    }}
+    button[data-testid="stBaseButton-secondary"]:hover:not(:disabled) p {{ color: {THEME_GREEN_INK}; }}
+    /* 탭 선택 표시 (글자 + 밑줄) */
+    [data-testid="stTab"][aria-selected="true"],
+    [data-testid="stTab"][aria-selected="true"] p {{ color: {THEME_GREEN_INK}; font-weight: 600; }}
+    [data-testid="stTab"] .react-aria-SelectionIndicator,
+    [data-baseweb="tab-highlight"] {{ background-color: {THEME_GREEN} !important; }}
+    /* 멀티셀렉트 태그·진행 바·토글 등 기본 빨간 강조 요소 */
+    [data-testid="stMultiSelect"] [data-baseweb="tag"] {{ background-color: {THEME_GREEN} !important; color: #fff !important; }}
+    [data-testid="stProgress"] [role="progressbar"] > div > div {{ background-color: {THEME_GREEN} !important; }}
+    [data-testid="stCheckbox"] label[data-baseweb="checkbox"] input:checked + div {{ background-color: {THEME_GREEN} !important; }}
+    /* 입력창·텍스트영역·선택상자·날짜: 라이트 그레이 배경 + 테두리, 포커스 시 올리브 */
+    [data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"],
+    [data-testid="stNumberInputContainer"], [data-testid="stSelectbox"] [role="group"],
+    [data-testid="stMultiSelect"] [role="group"], [data-testid="stDateInputField"] {{
+        background-color: {THEME_BEIGE}; border-color: {THEME_BORDER};
+    }}
+    /* 사이드바는 배경이 라이트 그레이라 입력창을 흰색으로 */
+    [data-testid="stSidebar"] [data-testid="stTextInputRootElement"],
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [role="group"] {{
+        background-color: #fff;
+    }}
+    [data-testid="stTextInputRootElement"]:focus-within, [data-testid="stTextAreaRootElement"]:focus-within,
+    [data-testid="stNumberInputContainer"]:focus-within, [data-testid="stSelectbox"] [role="group"]:focus-within,
+    [data-testid="stMultiSelect"] [role="group"]:focus-within, [data-testid="stDateInputField"]:focus-within {{
+        border-color: {THEME_GREEN};
+    }}
+    /* 안내(info)·성공(success) 박스 */
+    [data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]) > div,
+    [data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) > div {{
+        background-color: {THEME_GREEN_BG}; color: {THEME_GREEN_TEXT};
+    }}
+    [data-testid="stAlertContentInfo"], [data-testid="stAlertContentInfo"] p,
+    [data-testid="stAlertContentSuccess"], [data-testid="stAlertContentSuccess"] p {{
+        color: {THEME_GREEN_TEXT};
+    }}
+    /* 테두리 카드(요약·목록): 옅은 그레이 테두리 */
+    [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"] details {{
+        border-color: {THEME_BORDER} !important;
+    }}
+    /* 라디오·체크박스 선택 표시 */
+    [data-testid="stRadioOption"][data-selected] > div > div:first-child,
+    [data-testid="stCheckbox"] label[data-selected] > span + div {{
+        background-color: {THEME_GREEN}; border-color: {THEME_GREEN};
+    }}
+    </style>
+    """)
+
+
 def main() -> None:
     st.set_page_config(page_title="지출결의 업무", page_icon="🧾", layout="wide")
+    apply_theme_css()
     st.title("🧾 지출결의 업무")
     st.caption("지출결의서 내역을 입력하면 품의 문구 · 문서 제목 · 지출결의서/완료기안 엑셀 · 문자 보고 템플릿을 자동 생성하고, "
                "발급 내역을 대장으로 관리합니다.")
+    daily_backup()
     settings = render_sidebar()
     # key로 선택 탭을 기억 → [저장 및 발급대장 등록] / [불러오기] 콜백이 session_state로 탭을 바꿈
-    tab_write, tab_ledger, tab_drafts = st.tabs([TAB_WRITE, TAB_LEDGER, TAB_DRAFTS], key="main_tab", on_change="rerun")
+    tab_write, tab_ledger, tab_drafts, tab_backup = st.tabs([TAB_WRITE, TAB_LEDGER, TAB_DRAFTS, TAB_BACKUP],
+                                                            key="main_tab", on_change="rerun")
     with tab_write:
         render_writer(settings)
     with tab_ledger:
         render_ledger()
     with tab_drafts:
         render_drafts()
+    with tab_backup:
+        render_backup()
 
 
 if __name__ == "__main__":
