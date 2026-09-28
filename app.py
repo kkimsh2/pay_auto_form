@@ -83,9 +83,6 @@ BANKS = ["KB국민은행", "신한은행", "우리은행", "하나은행", "NH�
          "KDB산업은행", "Sh수협은행", "iM뱅크(대구은행)", "부산은행", "경남은행", "광주은행", "전북은행", "제주은행",
          "카카오뱅크", "케이뱅크", "토스뱅크"]  # 제1금융권 — 목록에 없으면 직접 입력
 
-# ---- 지출결의서 표 안의 [기안부서] 칸: 사이드바 값과 분리된 고정값 (사이드바 기안부서는 문서 제목에만 사용) ----
-DOC_DEPT = "인사총무팀"
-
 # ---- 입력 폼 (위젯 key → 초기값). 임시저장·불러오기·새로 작성이 이 key들을 사용 ----
 FORM_DATE_KEYS = ("f_write_date", "f_pay_date")
 
@@ -319,7 +316,7 @@ def build_body_text(info: dict, items: pd.DataFrame, totals: dict) -> str:
 
 
 def build_title(info: dict) -> str:
-    tags = "".join(f"[{t}]" for t in [info["company"], info["site"], info["dept"]] if t)
+    tags = "".join(f"[{t}]" for t in [info["company"], info["site"], info["title_dept"]] if t)  # 제목부서
     return f"{tags} {with_gun(info['subject'])}."
 
 
@@ -442,7 +439,7 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
     # ---- 제목 / 기본 정보 ----
     ws["B5"] = f"제목 : {title}"
     ws["D6"] = info["write_date"]
-    ws["G6"] = DOC_DEPT  # 사이드바 기안부서와 무관하게 고정
+    ws["G6"] = info["dept"]  # 기안부서 (제목부서와 별도)
     ws["J6"] = info["site"]
     ws["D7"] = info["pay_date"]
     ws["G7"] = info["drafter"]
@@ -726,7 +723,7 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
         + "</tr>",
         # 기본 정보
         "<tr>" + td("작성일", colspan=2, bold=True) + td(f"{info['write_date']:%Y-%m-%d}", colspan=2)
-        + td("기안부서", bold=True) + td(_h(DOC_DEPT), colspan=2) + td("사업소명", bold=True)
+        + td("기안부서", bold=True) + td(_h(info["dept"]), colspan=2) + td("사업소명", bold=True)
         + td(_h(info["site"]), colspan=3) + "</tr>",
         "<tr>" + td("결제요청일", colspan=2, bold=True)
         + td(f"{info['pay_date']:%Y-%m-%d}", colspan=2, bold=True, bg=EXP_GRAY, color=EXP_DATE_FONT)
@@ -864,7 +861,7 @@ def make_history_record(info: dict, items: pd.DataFrame, totals: dict) -> dict:
         "발급ID": f"{info['write_date']:%y%m%d}-{hashlib.sha1(key.encode()).hexdigest()[:6]}",
         "작성일": f"{info['write_date']:%Y-%m-%d}",
         "문서번호": info["doc_no"],
-        "기안부서": DOC_DEPT,  # 발급한 지출결의서 표와 같은 값
+        "기안부서": info["dept"],  # 발급한 지출결의서 표와 같은 값
         "기안자": info["drafter"],
         "지급처": ", ".join(v for v in vendors if v),
         "건명": info["subject"],
@@ -1630,7 +1627,10 @@ def render_sidebar() -> dict:
         settings = {
             "company": st.text_input("회사", "GSI").strip(),
             "site": st.text_input("사업장", "본사").strip(),
-            "dept": st.text_input("기안부서", "인사총무팀", help="문서 제목 [회사][사업장][기안부서]에만 쓰입니다. 지출결의서 표 안의 기안부서 칸은 항상 '인사총무팀'으로 고정.").strip(),
+            "title_dept": st.text_input("제목부서", "경영지원본부",
+                                        help="문서 제목 [회사][사업장][제목부서]에 쓰입니다.").strip(),
+            "dept": st.text_input("기안부서", "인사총무팀",
+                                  help="지출결의서 표(HTML·엑셀)의 기안부서 칸과 발급 대장에 쓰입니다.").strip(),
             "drafter": st.text_input("기안자", "김세희 사원").strip(),
         }
         st.divider()
@@ -1800,7 +1800,7 @@ def render_writer(settings: dict) -> None:
         "subject": item_summary(items),
         "reason": _text(form["f_reason"]), "attachment": _text(form["f_attachment"]),
         "remark": _text(form["f_remark"]),
-        "company": settings["company"], "site": settings["site"], "dept": settings["dept"],
+        "company": settings["company"], "site": settings["site"], "dept": settings["dept"], "title_dept": settings["title_dept"],
         "sms_to": settings["sms_to"], "sms_from": settings["sms_from"],
     }
     record = make_history_record(info, items, totals) if not items.empty else None
