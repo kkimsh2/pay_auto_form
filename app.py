@@ -1027,7 +1027,7 @@ def apply_inputs(show_toast: bool = True) -> None:
     st.session_state["applied"] = snapshot
     write_applied(snapshot)
     if show_toast:
-        st.toast("입력 내용을 적용했습니다. 새로고침해도 유지됩니다.", icon="✅")
+        st.toast("지출결의서를 생성했습니다. 새로고침해도 입력 내용이 유지됩니다.", icon="📄")
 
 
 def restore_applied_once() -> None:
@@ -1545,6 +1545,58 @@ def save_text_edit(key: str) -> None:
         st.toast(f"수정 내용 저장 실패: {exc}", icon="⚠️")
 
 
+def _start_text_edit(key: str) -> None:
+    st.session_state[f"{key}__draft"] = st.session_state[key]
+    st.session_state[f"{key}__editing"] = True
+
+
+def _apply_text_edit(key: str) -> None:
+    ss = st.session_state
+    ss[key] = ss.get(f"{key}__draft", ss[key])
+    ss[f"{key}__editing"] = False
+    save_text_edit(key)  # 확정본을 파일에 저장 → 새로고침해도 유지
+    st.toast("하단 문구를 적용했습니다.", icon="✅")
+
+
+def _cancel_text_edit(key: str) -> None:
+    st.session_state[f"{key}__editing"] = False
+
+
+def _reset_text(key: str) -> None:
+    """자동 생성 문구로 되돌리고 저장된 수정본 삭제."""
+    ss = st.session_state
+    ss[key] = ss[f"{key}__generated"]
+    ss[f"{key}__editing"] = False
+    save_text_edit(key)
+
+
+def editable_text(generated: str, key: str, height: int) -> str:
+    """[✏️ 수정] → 직접 고치고 → [✅ 적용]을 눌러야 확정되는 문구. 확정본만 결과(엑셀·HTML)에 쓰고 파일에 저장.
+
+    확정본은 text_edits.json에 (자동 생성본 기준으로) 저장 → 새로고침·재실행해도 같은 입력이면 복원.
+    입력이 바뀌어 자동 생성본이 달라지면 새 문구로 다시 시작.
+    """
+    ss = st.session_state
+    gen_key, edit_key = f"{key}__generated", f"{key}__editing"
+    if ss.get(gen_key) != generated:
+        ss[gen_key] = generated
+        ss[key] = load_text_edits().get(_edit_id(key, generated), generated)
+        ss[edit_key] = False
+    if ss.get(edit_key):
+        st.text_area("내용 (수정 중 — [✅ 적용]을 눌러야 확정됩니다)", key=f"{key}__draft", height=height)
+        c1, c2 = st.columns(2)
+        c1.button("✅ 적용", key=f"{key}_apply", type="primary", width="stretch", on_click=_apply_text_edit, args=(key,))
+        c2.button("취소", key=f"{key}_cancel", width="stretch", on_click=_cancel_text_edit, args=(key,))
+    else:
+        edited = ss[key] != generated
+        st.text_area("내용" + (" (수정본 적용됨)" if edited else ""), ss[key], height=height, disabled=True)
+        c1, c2 = st.columns(2)
+        c1.button("✏️ 수정", key=f"{key}_edit", width="stretch", on_click=_start_text_edit, args=(key,))
+        c2.button("↺ 자동 생성 문구로", key=f"{key}_reset", width="stretch", disabled=not edited,
+                  on_click=_reset_text, args=(key,))
+    return ss[key]
+
+
 def synced_text(label: str, generated: str, key: str, height: int | None = None) -> str:
     """입력이 바뀌면 자동 재생성하고, 그 전까지는 사용자가 수정한 내용을 유지.
 
@@ -1575,7 +1627,7 @@ def render_sidebar() -> dict:
         settings = {
             "company": st.text_input("회사", "GSI").strip(),
             "site": st.text_input("사업장", "본사").strip(),
-            "dept": st.text_input("부서", "경영지원본부").strip(),
+            "dept": st.text_input("기안부서", "인사총무팀").strip(),
             "drafter": st.text_input("기안자", "김세희 사원").strip(),
         }
         st.divider()
@@ -1595,11 +1647,49 @@ def render_sidebar() -> dict:
     return settings
 
 
-def render_items_editor(vat_mode: str) -> pd.DataFrame:
+def _items_editor_key() -> str:
+    return f"items_editor_{st.session_state.setdefault('items_ver', 0)}"
+
+
+def committed_items() -> pd.DataFrame:
+    """폼 제출 시점의 내역 표 = 저장된 표 + 표 위젯의 편집분(edited_rows), 계산 칸 다시 채움."""
+    ss = st.session_state
+    df = ss.get("items_df", blank_items()).copy()
+    state = ss.get(_items_editor_key()) or {}
+    for row, changes in (state.get("edited_rows") or {}).items():
+        for col, value in changes.items():
+            if col in df.columns:
+                df[col] = df[col].astype(object)
+                df.at[df.index[int(row)], col] = value
+    return normalize_items(df, VAT_MODES.get(ss.get("f_vat"), "exclusive"))
+
+
+def _submit_add_row() -> None:
+    _set_items(pd.concat([committed_items(), blank_items()], ignore_index=True))
+
+
+def _submit_delete_rows() -> None:
+    df = committed_items()
+    df = df[~df["선택"].astype(bool)]
+    _set_items(normalize_items(df if len(df) else blank_items(), VAT_MODES.get(st.session_state.get("f_vat"), "exclusive")))
+
+
+def _submit_draft() -> None:
+    _set_items(committed_items())
+    save_draft()
+
+
+def _submit_generate() -> None:
+    _set_items(committed_items())
+    apply_inputs()
+
+
+def render_items_editor(vat_mode: str) -> None:
     """내역 통합 표 1개: 입력 칸(품목·업체명·수량·단가·배송비·비고) + 자동 계산 칸(순번·공급가액·부가세·합계).
 
-    편집할 때마다 계산 칸을 다시 채운 표로 교체하고, 표 위젯은 새 key로 다시 그림
-    (같은 key로 데이터만 바꾸면 이전 편집 내용이 행 추가·삭제 후 엉뚱한 행에 다시 적용됨).
+    입력 폼(st.form) 안에서 쓰므로 칸을 편집해도 앱이 다시 실행되지 않음(입력 중 새로고침·유실 방지).
+    계산 칸은 [행 추가]·[선택 행 삭제]·[임시저장]·[지출결의서 생성]을 누를 때 다시 채우고,
+    표 위젯은 새 key로 다시 그림 (같은 key로 데이터만 바꾸면 이전 편집분이 엉뚱한 행에 다시 적용됨).
     """
     ss = st.session_state
     if "items_df" not in ss:
@@ -1608,9 +1698,9 @@ def render_items_editor(vat_mode: str) -> pd.DataFrame:
     if not current.equals(ss["items_df"]):  # 부가세 방식이 바뀐 경우
         _set_items(current)
     money = lambda label: st.column_config.NumberColumn(label, format="localized", disabled=True)  # noqa: E731
-    edited = st.data_editor(
+    st.data_editor(
         ss["items_df"],
-        key=f"items_editor_{ss.setdefault('items_ver', 0)}",
+        key=_items_editor_key(),
         num_rows="fixed",
         width="stretch",
         hide_index=True,
@@ -1629,31 +1719,15 @@ def render_items_editor(vat_mode: str) -> pd.DataFrame:
             "비고": st.column_config.TextColumn("비고"),
         },
     )
-    updated = normalize_items(edited, vat_mode)
-    if not updated.equals(ss["items_df"]):
-        _set_items(updated)
-        st.rerun()
-
-    selected = int(ss["items_df"]["선택"].sum())
     c1, c2, _ = st.columns([1, 1, 3])
-    c1.button("➕ 행 추가", key="items_add", width="stretch",
-              on_click=lambda: _set_items(pd.concat([ss["items_df"], blank_items()], ignore_index=True)))
-    c2.button(f"🗑️ 선택 행 삭제 ({selected})", key="items_delete", width="stretch", disabled=not selected,
-              on_click=lambda: _set_items(normalize_items(
-                  ss["items_df"][~ss["items_df"]["선택"]].pipe(lambda d: d if len(d) else blank_items()), vat_mode)))
-    return ss["items_df"]
+    c1.form_submit_button("➕ 행 추가", key="items_add", width="stretch", on_click=_submit_add_row)
+    c2.form_submit_button("🗑️ 선택 행 삭제", key="items_delete", width="stretch", on_click=_submit_delete_rows,
+                          help="'선택' 칸을 체크한 행을 삭제합니다.")
 
 
-def render_writer(settings: dict) -> None:
-    # ---- 기능 1: 입력 ----
+def render_input_fields() -> None:
+    """입력 폼 내용 (st.form 안에서 호출 → 입력 중에는 재실행 없음)."""
     ss = st.session_state
-    restore_applied_once()  # 새로고침·재실행 시 마지막으로 [적용]한 입력값 복원
-    for key, value in form_defaults().items():  # 처음 한 번만 빈 값으로 시작 (샘플 데이터 없음)
-        ss.setdefault(key, value)
-    st.header("1️⃣ 지출결의서 입력")
-    if ss.get("current_draft_id"):
-        st.caption("✏️ 임시저장본을 불러와 수정 중입니다. [💾 임시저장]을 누르면 같은 항목에 덮어씁니다.")
-
     c1, c2, c3, c4 = st.columns(4)
     c1.date_input("작성일", key="f_write_date")
     c2.date_input("입금요청일", key="f_pay_date")
@@ -1674,22 +1748,41 @@ def render_writer(settings: dict) -> None:
     st.subheader("내역")
     st.caption("품목·업체명·수량·단가·배송비·비고를 입력하면 순번·공급가액·부가세·합계가 자동 계산됩니다. "
                "공급가액 = 수량 × 단가 + 배송비 (배송비도 부가세 과세 — 기존 지출결의서·완료기안 양식 기준)")
-    vat_mode = VAT_MODES[ss["f_vat"]]
-    render_items_editor(vat_mode)
+    render_items_editor(VAT_MODES[ss["f_vat"]])
 
     st.text_area("사유", key="f_reason", height=90, placeholder="예: 업무 수행에 필요한 물품 구매")
     st.text_area("첨부", key="f_attachment", height=90, placeholder="예: 가. 견적서 1부.\n나. 통장사본 1부.")
     st.text_area("특이사항", key="f_remark", height=90, placeholder="없으면 비워 두세요")
 
-    # ---- [적용]: 여기서부터 아래 결과는 마지막으로 적용한 입력값 기준 ----
+    c1, c2 = st.columns([1, 2])
+    c1.form_submit_button("💾 임시저장", key="btn_draft", width="stretch", on_click=_submit_draft)
+    c2.form_submit_button("📄 지출결의서 생성", key="btn_apply", type="primary", width="stretch",
+                          on_click=_submit_generate,
+                          help="입력한 내용을 아래 결과(엑셀·HTML·품의 문구·제목·문자)에 반영합니다. 새로고침해도 유지됩니다.")
+
+
+def render_writer(settings: dict) -> None:
+    # ---- 기능 1: 입력 ----
+    ss = st.session_state
+    restore_applied_once()  # 새로고침·재실행 시 마지막으로 [적용]한 입력값 복원
+    for key, value in form_defaults().items():  # 처음 한 번만 빈 값으로 시작 (샘플 데이터 없음)
+        ss.setdefault(key, value)
+    st.header("1️⃣ 지출결의서 입력")
+    if ss.get("current_draft_id"):
+        st.caption("✏️ 임시저장본을 불러와 수정 중입니다. [💾 임시저장]을 누르면 같은 항목에 덮어씁니다.")
+
+    st.caption("입력하는 동안에는 화면이 다시 그려지지 않습니다. 다 입력한 뒤 [📄 지출결의서 생성]을 누르세요. "
+               "(계산 칸은 [행 추가]·[선택 행 삭제]·[임시저장]·[생성]을 누를 때 갱신)")
+    with st.form("input_form", border=False, enter_to_submit=False):
+        render_input_fields()
+
+    # ---- 여기서부터 아래 결과는 마지막으로 [생성]한 입력값 기준 ----
     applied = ss.get("applied")
     pending = not _same_snapshot(applied, input_snapshot())
-    st.button("✅ 적용", key="btn_apply", type="primary", width="stretch", on_click=apply_inputs,
-              help="입력한 내용을 아래 결과(품의 문구·제목·엑셀·HTML·문자)에 반영합니다. 새로고침해도 유지됩니다.")
     if applied is None:
-        st.info("입력을 마친 뒤 [✅ 적용]을 누르면 아래에 결과가 만들어집니다.")
+        st.info("입력을 마친 뒤 [📄 지출결의서 생성]을 누르면 아래에 결과가 만들어집니다.")
     elif pending:
-        st.warning("적용하지 않은 변경 사항이 있습니다. 아래 결과는 마지막으로 적용한 내용 기준입니다. [✅ 적용]을 눌러 반영하세요.")
+        st.warning("생성 후 바뀐 입력이 있습니다. 아래 결과는 마지막으로 생성한 내용 기준입니다. [📄 지출결의서 생성]을 눌러 반영하세요.")
 
     form = snapshot_form(applied or {})
     vat_mode = VAT_MODES.get(form["f_vat"], "exclusive")
@@ -1710,8 +1803,7 @@ def render_writer(settings: dict) -> None:
     record = make_history_record(info, items, totals) if not items.empty else None
 
     # ---- 임시저장 / 발급대장 등록 ----
-    c1, c2, c3 = st.columns(3)
-    c1.button("💾 임시저장", key="btn_draft", width="stretch", on_click=save_draft)
+    c2, c3 = st.columns(2)
     c2.button("📒 저장 및 발급대장 등록", key="btn_register", type="primary", width="stretch",
               disabled=record is None, on_click=register_record, args=(record,),
               help="history.csv에 등록하고 [2. 발급 대장] 탭으로 이동합니다.")
@@ -1721,7 +1813,7 @@ def render_writer(settings: dict) -> None:
     if applied is None:
         return
     if items.empty:
-        st.info("내역에 품목을 1개 이상 입력하고 [✅ 적용]을 누르세요.")
+        st.info("내역에 품목을 1개 이상 입력하고 [📄 지출결의서 생성]을 누르세요.")
         return
 
     # 문서번호는 발급 대장에서 입력 → 같은 건이 대장에 있으면 그 문서번호를 완료기안에 사용
@@ -1738,7 +1830,7 @@ def render_writer(settings: dict) -> None:
     # ---- 기능 2: 품의 문구 ----
     with left:
         st.header("2️⃣ 품의서 하단 문구")
-        body = synced_text("내용 (수정 가능)", build_body_text(info, items, totals), "body_text", 360)
+        body = editable_text(build_body_text(info, items, totals), "body_text", 360)
         copy_button(body, "클립보드 복사", "body")
 
     # ---- 기능 3 · 5: 제목 / 문자 ----
