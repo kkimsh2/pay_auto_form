@@ -100,6 +100,10 @@ def form_defaults() -> dict:
 # ---- 임시저장 ----
 DRAFTS_PATH = Path(os.environ.get("JICHUL_DRAFTS_PATH") or APP_DIR / "drafts.json")
 
+# ---- 생성 문구 수정본 (품의 문구·제목·문자) — 새로고침해도 유지 ----
+TEXT_EDITS_PATH = Path(os.environ.get("JICHUL_TEXT_EDITS_PATH") or APP_DIR / "text_edits.json")
+TEXT_EDITS_MAX = 100
+
 # ---- 탭 ----
 TAB_WRITE, TAB_LEDGER, TAB_DRAFTS, TAB_BACKUP = "1. 지출결의서 작성", "2. 발급 대장", "3. 임시저장 목록", "4. 백업"
 
@@ -762,9 +766,11 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
     text.append(f'<p style="{p}font-size:11pt;margin-top:10px;">끝.</p>')
 
     return (
-        f'<div style="{font}max-width:820px;margin:0 auto;color:#000;">'
+        # 비즈메카 등 게시판 편집기에 붙여넣을 때 가운데 정렬·여백 없이 왼쪽부터 붙도록 margin/padding 0 + 좌측 정렬
+        f'<div style="{font}max-width:820px;margin:0;padding:0;text-align:left;box-sizing:border-box;color:#000;">'
         f'<p style="{p}font-size:10pt;margin-bottom:4px;">(단위 : KRW)</p>'
-        f'<table style="{font}border-collapse:collapse;width:100%;table-layout:fixed;">'
+        f'<table align="left" style="{font}border-collapse:collapse;width:100%;table-layout:fixed;'
+        f'margin:0;padding:0;box-sizing:border-box;float:none;">'
         f"<colgroup>{colgroup}</colgroup><tbody>{''.join(rows)}</tbody></table>"
         f"{''.join(text)}</div>"
     )
@@ -1427,18 +1433,52 @@ def copy_button(text: str, label: str, key: str) -> None:
     )
 
 
+def _edit_id(key: str, generated: str) -> str:
+    return f"{key}:{hashlib.sha1(generated.encode('utf-8')).hexdigest()}"
+
+
+def load_text_edits() -> dict[str, str]:
+    try:
+        data = json.loads(TEXT_EDITS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_text_edit(key: str) -> None:
+    """[적용](Ctrl+Enter/포커스 이동) 콜백: 수정본을 파일에 저장 → 새로고침해도 같은 입력이면 복원."""
+    ss = st.session_state
+    generated, value = ss.get(f"{key}__generated"), ss.get(key)
+    if generated is None or value is None:
+        return
+    edits = load_text_edits()
+    edit_id = _edit_id(key, generated)
+    edits.pop(edit_id, None)
+    if value != generated:  # 자동 생성본으로 되돌리면 저장본 삭제
+        edits[edit_id] = value
+    edits = dict(list(edits.items())[-TEXT_EDITS_MAX:])  # 최근 것만 보관
+    try:
+        tmp = TEXT_EDITS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(edits, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(TEXT_EDITS_PATH)
+    except OSError as exc:
+        st.toast(f"수정 내용 저장 실패: {exc}", icon="⚠️")
+
+
 def synced_text(label: str, generated: str, key: str, height: int | None = None) -> str:
     """입력이 바뀌면 자동 재생성하고, 그 전까지는 사용자가 수정한 내용을 유지.
 
+    수정본은 text_edits.json에 (자동 생성본 기준으로) 저장 → 새로고침·재실행 후에도
+    같은 입력(같은 자동 생성본)이면 수정본을 다시 불러옴.
     height가 있으면 text_area, 없으면 한 줄 text_input.
     """
     gen_key = f"{key}__generated"
     if st.session_state.get(gen_key) != generated:
         st.session_state[gen_key] = generated
-        st.session_state[key] = generated
+        st.session_state[key] = load_text_edits().get(_edit_id(key, generated), generated)
     if height is None:
-        return st.text_input(label, key=key)
-    return st.text_area(label, key=key, height=height)
+        return st.text_input(label, key=key, on_change=save_text_edit, args=(key,))
+    return st.text_area(label, key=key, height=height, on_change=save_text_edit, args=(key,))
 
 
 # ---------------------------------------------------------------------------
