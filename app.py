@@ -56,17 +56,20 @@ DONE_TEMPLATE_CHECK = {"B4": "순번", "C4": "문서번호", "D4": "지급처", 
 
 # ---- 지출결의서: '260821 지출결의서.xlsx'의 [2026 지출결의서] 시트 양식 ----
 APP_DIR = Path(__file__).resolve().parent
-EXP_TEMPLATE_NAME = "지출결의서.xlsx"  # 없으면 폴더의 '*지출결의서*.xlsx' 사용
-EXP_ITEM_FIRST, EXP_ITEM_LAST = 11, 61  # 원본 내역 행
-EXP_VAT_ROW, EXP_TOTAL_ROW = 62, 63
+EXP_TEMPLATE_NAME = "지출결의서_260824.xlsx"  # 없으면 폴더의 '*지출결의서*.xlsx' 사용
+EXP_ITEM_FIRST, EXP_ITEM_LAST = 11, 60  # 원본 내역 행
+EXP_SUBTOTAL_ROW, EXP_TOTAL_ROW = 61, 62  # 소계(열별 합) / 합계(I:K 병합, 공급가액+부가세+배송비)
+EXP_PAY_ROW, EXP_ACCOUNT_ROW, EXP_PAYER_ROW = 63, 64, 65  # 결제방법 / 계좌정보 / 법인구분
+EXP_BODY_FIRST, EXP_BODY_LAST = 69, 76  # 품의 문구 1~4번 (제목·본문 2행씩), 끝.은 그다음 행
 EXP_TEMPLATE_CHECK = {  # 템플릿 구조 확인용 고정 문구
-    "B3": "지 출 결 의 서", "B10": "순번", "C10": "품목(사유)", "B62": "부 가 세", "B63": "합 계",
-    "B64": "결제방법", "B65": "계좌정보", "B66": "법인구분", "B68": "상기와 같이 지출결의서를 작성 품의합니다.",
+    "B3": "지 출 결 의 서", "B10": "순번", "C10": "품목(사유)", "I10": "공급가액", "J10": "부가세", "K10": "배송비",
+    "L10": "비고", "B61": "소 계", "B62": "합 계", "B63": "결제방법", "B64": "계좌정보", "J64": "예금주",
+    "B65": "법인구분", "B67": "상기와 같이 지출결의서를 작성 품의합니다.", "B69": "1. 주요내용",
 }
 EXP_TBD = "추후별도기재"
 EXP_WIDTHS = {
     "A": 2.125, "B": 5.625, "C": 9.0, "D": 9.0, "E": 9.0, "F": 21.125, "G": 6.5, "H": 11.5,
-    "I": 10.625, "J": 10.5, "K": 5.625, "L": 15.625, "M": 2.125, "N": 2.125,
+    "I": 10.625, "J": 10.5, "K": 10.5, "L": 5.625, "M": 15.625, "N": 2.125,
     "O": 10.125, "P": 9.0, "Q": 9.0, "R": 9.0, "S": 10.5,
 }
 EXP_GRAY = "D9D9D9"        # 순번·결제요청일·금액 (흰색 15% 어둡게)
@@ -423,10 +426,12 @@ def _text_height(text: str, width: float, line_pt: float, minimum: float) -> flo
 
 def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals: dict,
                         body: str, title: str) -> bytes:
-    """원본 지출결의서 템플릿을 불러와 지정 셀에 값만 채움 (서식·병합·열 너비·인쇄 설정은 원본 그대로).
+    """원본 지출결의서 템플릿(지출결의서_260824.xlsx)을 불러와 지정 셀에 값만 채움 (서식·병합·열 너비·인쇄 설정은 원본 그대로).
 
-    - 내역: 11행부터 품목 수만큼 작성, 남는 내역 행(최대 61행까지)은 숨김 → 원본 구조 보존
-    - 품의 문구: 1~3번은 원본 70~75행, 4. 특이사항은 원본의 빈 76~77행에 같은 서식으로 이어서 작성
+    - 내역: 11행부터 품목 수만큼 작성, 남는 내역 행(최대 60행까지)은 숨김 → 원본 구조 보존
+      열: C 품목 · F 업체명 · G 수량 · H 단가 · I 공급가액(=수량×단가) · J 부가세 · K 배송비 · L 비고
+    - 소계(61행): I·J·K 열별 합 / 합계(62행, I:K 병합): 공급가액+부가세+배송비 = 앱의 합계
+    - 품의 문구: 69행부터 제목·본문 2행씩 (최대 4번), 남는 행은 숨기고 끝.은 77행
     """
     wb = load_workbook(template)
     ws = wb.worksheets[0]
@@ -447,13 +452,14 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
     ws["I8"] = f"=I{EXP_TOTAL_ROW}"
 
     # ---- 내역 (11행~) — 서식은 원본 11행(입력 행) 서식을 복사 ----
+    inclusive = info["vat_mode"] == "inclusive"  # 단가에 VAT 포함 → 부가세 칸 0 (단가·배송비에 이미 들어 있음)
     records = items.to_dict("records")
     base_height = ws.row_dimensions[first].height or 45.0
     for i, r in enumerate(range(first, last + 1)):
         rec = records[i] if i < len(records) else None
-        _copy_row_style(ws, first, r)
+        _copy_row_style(ws, first, r, "BCDEFGHIJKLM")
         ws[f"B{r}"] = f'=IF(C{r}="","",ROW()-{first - 1})'
-        for col in "CFGHIJK":
+        for col in "CFGHIJKL":
             ws[f"{col}{r}"] = None
         if rec is None:  # 남는 행: 비우고 숨김
             ws.row_dimensions[r].hidden = True
@@ -463,47 +469,55 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
         ws[f"F{r}"] = rec["업체명"]
         ws[f"G{r}"] = int(rec["수량"]) if float(rec["수량"]).is_integer() else rec["수량"]
         ws[f"H{r}"] = int(rec["단가"]) if float(rec["단가"]).is_integer() else rec["단가"]
-        ws[f"I{r}"] = int(rec["배송비"])
-        ws[f"J{r}"] = f"=(G{r}*H{r})+I{r}"
-        ws[f"K{r}"] = rec["비고"] or "-"
+        ws[f"I{r}"] = f"=G{r}*H{r}"  # 공급가액 (배송비는 K열 — I+K = 앱의 공급가액)
+        ws[f"J{r}"] = 0 if inclusive else int(rec["부가세"])  # 배송비분 부가세 포함
+        ws[f"K{r}"] = int(rec["배송비"])
+        ws[f"L{r}"] = rec["비고"] or "-"
         ws.row_dimensions[r].height = max(
             base_height,
             _text_height(rec["품목"], width("CDE"), 15.0, 0),
             _text_height(rec["업체명"], width("F"), 15.0, 0),
-            _text_height(rec["비고"], width("KL"), 15.0, 0),
+            _text_height(rec["비고"], width("LM"), 15.0, 0),
         )
 
-    # ---- 부가세 / 합계 ----
-    inclusive = info["vat_mode"] == "inclusive"  # 단가에 VAT 포함 → 소계에 이미 들어 있음
-    ws[f"I{EXP_VAT_ROW}"] = 0 if inclusive else int(totals["부가세"])
-    ws[f"K{EXP_VAT_ROW}"] = "단가에 VAT 포함" if inclusive else "-"
-    ws[f"I{EXP_TOTAL_ROW}"] = f"=SUM(J{first}:J{last},I{EXP_VAT_ROW})"
+    # ---- 소계(열별 합) / 합계 ----
+    sub = EXP_SUBTOTAL_ROW
+    for col in "IJK":
+        ws[f"{col}{sub}"] = f"=SUM({col}{first}:{col}{last})"
+    ws[f"L{sub}"] = "-"
+    ws[f"I{EXP_TOTAL_ROW}"] = f"=SUM(I{sub}:K{sub})"
+    ws[f"L{EXP_TOTAL_ROW}"] = "단가에 VAT 포함" if inclusive else "-"
 
     # ---- 결제방법 / 계좌정보 / 법인구분 ----
-    ws["D64"] = info["pay_method"]
-    ws["G64"] = info["evidence"]
-    ws["E65"] = info["bank"] or "-"
-    ws["G65"] = info["account"] or EXP_TBD
-    ws["K65"] = info["holder"] or EXP_TBD
-    ws["D66"] = f"  {info['payer']}  입금 요청"
+    ws[f"D{EXP_PAY_ROW}"] = info["pay_method"]
+    ws[f"G{EXP_PAY_ROW}"] = info["evidence"]
+    ws[f"E{EXP_ACCOUNT_ROW}"] = info["bank"] or "-"
+    ws[f"G{EXP_ACCOUNT_ROW}"] = info["account"] or EXP_TBD
+    ws[f"L{EXP_ACCOUNT_ROW}"] = info["holder"] or EXP_TBD  # 예금주 값 칸 L:M (K는 원본의 빈 칸)
+    ws[f"D{EXP_PAYER_ROW}"] = f"  {info['payer']}  입금 요청"
 
     # ---- 품의 문구 (1~4번 + 끝.) ----
-    # 원본: 70/71(1번) · 72/73(2번) · 74/75(3번) · 76(끝.) — 4번은 76/77에 원본 제목·본문 서식 복사, 끝.은 78행(원본 병합 B78:L78)
+    # 원본: 69 제목 · 70 본문 · … · 75 끝. (69~76행 모두 B:M 병합) → 69부터 제목·본문 2행씩 다시 채우고 끝.은 77행
     sections = parse_body_sections(body)
     if len(sections) > 4:  # 5번 이상을 추가했다면 4번 칸에 이어 붙임
         extra = "\n".join(f"{h}\n{t}" if h else t for h, t in sections[3:])
         sections = sections[:3] + [("", extra)]
-    end_style = copy(ws["B76"]._style)  # 원본 '끝.' 서식 (덮어쓰기 전에 보관)
-    if "B77:L77" not in {str(m) for m in ws.merged_cells.ranges}:
-        ws.merge_cells("B77:L77")
-    _copy_row_style(ws, 74, 76, "B")  # 4번 제목 ← 3번 제목 서식
-    _copy_row_style(ws, 75, 77, "B")  # 4번 본문 ← 3번 본문 서식
+    b0 = EXP_BODY_FIRST
+    header_style, text_style = copy(ws[f"B{b0}"]._style), copy(ws[f"B{b0 + 1}"]._style)  # 덮어쓰기 전에 보관
+    end_style = copy(ws["B75"]._style)  # 원본 '끝.' 서식
+    header_height = ws.row_dimensions[b0].height or 17.25
+    end_row = EXP_BODY_LAST + 1
+    merged = {str(m) for m in ws.merged_cells.ranges}
+    for r in range(b0, end_row + 1):
+        if f"B{r}:M{r}" not in merged:
+            ws.merge_cells(f"B{r}:M{r}")
 
-    body_width = width("BCDEFGHIJKL")
-    header_height = ws.row_dimensions[70].height or 17.25
+    body_width = width("BCDEFGHIJKLM")
     for i in range(4):
-        h_row, b_row = 70 + 2 * i, 71 + 2 * i
+        h_row, b_row = b0 + 2 * i, b0 + 1 + 2 * i
         header, text = sections[i] if i < len(sections) else ("", "")
+        ws[f"B{h_row}"]._style = copy(header_style)
+        ws[f"B{b_row}"]._style = copy(text_style)
         ws[f"B{h_row}"] = header or None
         ws[f"B{b_row}"] = text or None
         ws.row_dimensions[h_row].height = header_height
@@ -511,12 +525,12 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
         hide = i >= len(sections)
         ws.row_dimensions[h_row].hidden = hide
         ws.row_dimensions[b_row].hidden = hide
-    ws["B78"]._style = end_style
-    ws["B78"] = "끝."
-    ws.row_dimensions[78].hidden = False
+    ws[f"B{end_row}"]._style = end_style
+    ws[f"B{end_row}"] = "끝."
+    ws.row_dimensions[end_row].hidden = False
 
-    # ---- 인쇄 영역: 원본 A1:M76 → 끝.(78행)까지 ----
-    ws.print_area = "A1:M78"
+    # ---- 인쇄 영역: 원본 A1:N76 → 끝.(77행)까지 ----
+    ws.print_area = f"A1:N{end_row}"
 
     buf = BytesIO()
     wb.save(buf)
@@ -708,15 +722,14 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
     def num(v) -> str:
         return f"{int(v):,}" if v else "-"
 
-    cols = ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+    cols = ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]
     total_w = sum(EXP_WIDTHS[c] for c in cols)
     colgroup = "".join(f'<col style="width:{EXP_WIDTHS[c] / total_w * 100:.2f}%">' for c in cols)
     inclusive = info["vat_mode"] == "inclusive"
-    vat_shown = 0 if inclusive else int(totals["부가세"])
 
     rows = [
-        # 제목 / 결재란
-        "<tr>" + td("지 출 결 의 서", colspan=9, rowspan=2, bold=True, size=24)
+        # 제목 / 결재란 (K3:K5는 원본의 빈 칸)
+        "<tr>" + td("지 출 결 의 서", colspan=9, rowspan=2, bold=True, size=24) + td("", rowspan=3)
         + td("결<br>재", rowspan=3, bold=True) + td("대표이사", bold=True, height=34) + "</tr>",
         "<tr>" + td("", rowspan=2, height=60) + "</tr>",
         "<tr>" + td(f"제목 : {_h(title)}", colspan=9, bold=True, color=EXP_TITLE_FONT, align="left", size=9)
@@ -724,39 +737,46 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
         # 기본 정보
         "<tr>" + td("작성일", colspan=2, bold=True) + td(f"{info['write_date']:%Y-%m-%d}", colspan=2)
         + td("기안부서", bold=True) + td(_h(info["dept"]), colspan=2) + td("사업소명", bold=True)
-        + td(_h(info["site"]), colspan=3) + "</tr>",
+        + td(_h(info["site"]), colspan=4) + "</tr>",
         "<tr>" + td("결제요청일", colspan=2, bold=True)
         + td(f"{info['pay_date']:%Y-%m-%d}", colspan=2, bold=True, bg=EXP_GRAY, color=EXP_DATE_FONT)
         + td("기안자", bold=True) + td(_h(info["drafter"]), colspan=2) + td("요청자", bold=True)
-        + td(_h(info["requester"]), colspan=3) + "</tr>",
+        + td(_h(info["requester"]), colspan=4) + "</tr>",
         "<tr>" + td("금액", colspan=2, bold=True) + td("일금", bold=True)
         + td(f"{korean_amount(int(totals['합계']))}원 정", colspan=4, bold=True, bg=EXP_GRAY)
-        + td(f"₩{int(totals['합계']):,}", colspan=4, bold=True, bg=EXP_GRAY) + "</tr>",
+        + td(f"₩{int(totals['합계']):,}", colspan=5, bold=True, bg=EXP_GRAY) + "</tr>",
         # 내역
-        "<tr>" + td("내 역", colspan=11, bold=True) + "</tr>",
+        "<tr>" + td("내 역", colspan=12, bold=True) + "</tr>",
         "<tr>" + td("순번", bold=True) + td("품목(사유)", colspan=3, bold=True) + td("업체명", bold=True)
-        + td("수량", bold=True) + td("단가", bold=True) + td("배송비", bold=True) + td("소계", bold=True)
-        + td("비고", colspan=2, bold=True) + "</tr>",
+        + td("수량", bold=True) + td("단가", bold=True) + td("공급가액", bold=True) + td("부가세", bold=True)
+        + td("배송비", bold=True) + td("비고", colspan=2, bold=True) + "</tr>",
     ]
+    sums = {"공급가액": 0, "부가세": 0, "배송비": 0}
     for rec in items.to_dict("records"):
-        subtotal = int(round(rec["수량"] * rec["단가"])) + int(rec["배송비"])
+        line = {"공급가액": int(round(rec["수량"] * rec["단가"])),  # 엑셀 I열과 같음 (배송비는 K열)
+                "부가세": 0 if inclusive else int(rec["부가세"]), "배송비": int(rec["배송비"])}
+        for k, v in line.items():
+            sums[k] += v
         rows.append(
             "<tr>" + td(rec["순번"], bg=EXP_GRAY, height=34) + td(_h(rec["품목"]), colspan=3)
             + td(_h(rec["업체명"])) + td(qty_str(rec["수량"])) + td(num(rec["단가"]))
-            + td(num(rec["배송비"])) + td(num(subtotal)) + td(_h(rec["비고"] or "-"), colspan=2) + "</tr>"
+            + td(num(line["공급가액"])) + td(num(line["부가세"])) + td(num(line["배송비"]))
+            + td(_h(rec["비고"] or "-"), colspan=2) + "</tr>"
         )
-    rows += [
-        "<tr>" + td("부 가 세", colspan=7, bold=True) + td(f"₩{vat_shown:,}", colspan=2, bold=True, bg=EXP_LIGHT)
-        + td("단가에 VAT 포함" if inclusive else "-", colspan=2) + "</tr>",
+    rows += [  # 소계 = 열별 합, 합계 = 공급가액+부가세+배송비
+        "<tr>" + td("소 계", colspan=7, bold=True) + td(num(sums["공급가액"]), bold=True, bg=EXP_LIGHT)
+        + td(num(sums["부가세"]), bold=True, bg=EXP_LIGHT) + td(num(sums["배송비"]), bold=True, bg=EXP_LIGHT)
+        + td("-", colspan=2) + "</tr>",
         "<tr>" + td("합 계", colspan=7, bold=True)
-        + td(f"₩{int(totals['합계']):,}", colspan=2, bold=True, bg=EXP_LIGHT) + td("-", colspan=2) + "</tr>",
+        + td(f"₩{int(totals['합계']):,}", colspan=3, bold=True, bg=EXP_LIGHT)
+        + td("단가에 VAT 포함" if inclusive else "-", colspan=2) + "</tr>",
         "<tr>" + td("결제방법", colspan=2, bold=True) + td(_h(info["pay_method"]), colspan=2)
-        + td("증빙구분", bold=True) + td(_h(info["evidence"]), colspan=6) + "</tr>",
+        + td("증빙구분", bold=True) + td(_h(info["evidence"]), colspan=7) + "</tr>",
         "<tr>" + td("계좌정보", colspan=2, bold=True) + td("은행", bold=True) + td(_h(info["bank"] or "-"))
         + td("계좌번호", bold=True) + td(_h(info["account"] or EXP_TBD), colspan=3)
-        + td("예금주", bold=True) + td(_h(info["holder"] or EXP_TBD), colspan=2) + "</tr>",
+        + td("예금주", bold=True) + td("") + td(_h(info["holder"] or EXP_TBD), colspan=2) + "</tr>",
         "<tr>" + td("법인구분", colspan=2, bold=True)
-        + td(f"&nbsp;&nbsp;{_h(info['payer'])}&nbsp;&nbsp;입금 요청", colspan=9, bold=True, align="left") + "</tr>",
+        + td(f"&nbsp;&nbsp;{_h(info['payer'])}&nbsp;&nbsp;입금 요청", colspan=10, bold=True, align="left") + "</tr>",
     ]
 
     p = f"{font}margin:0;text-align:left;"
