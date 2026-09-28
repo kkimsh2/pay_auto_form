@@ -42,6 +42,7 @@ VAT_MODES = {
     "포함 (단가 = VAT 포함가)": "inclusive",
     "면세 / 영세": "exempt",
 }
+VAT_INCLUSIVE_LABEL = "포함 (단가 = VAT 포함가)"  # 기본값: 수량 1이면 공급가액 + 부가세 = 단가
 
 # ---- 완료기안 엑셀: 원본 '*완료기안*.xlsx'의 [입금요청] 시트에 값만 채움 ----
 DONE_TEMPLATE_NAME = "완료기안 결제요청.xlsx"  # 없으면 폴더의 '*완료기안*.xlsx' 중 원본(가장 큰 파일)
@@ -94,7 +95,7 @@ def form_defaults() -> dict:
     today = date.today()
     return {
         "f_write_date": today, "f_pay_date": today, "f_payer": "GSI", "f_urgent": False,
-        "f_pay_method": PAY_METHODS[0], "f_evidence": EVIDENCE_TYPES[0], "f_vat": list(VAT_MODES)[0],
+        "f_pay_method": PAY_METHODS[0], "f_evidence": EVIDENCE_TYPES[0], "f_vat": VAT_INCLUSIVE_LABEL,
         "f_bank": None, "f_account": "", "f_holder": "",
         "f_reason": "", "f_attachment": "", "f_remark": "",
     }
@@ -424,6 +425,22 @@ def _text_height(text: str, width: float, line_pt: float, minimum: float) -> flo
     return max(minimum, line_pt * lines + 4)
 
 
+def sheet_amounts(rec: dict) -> tuple[int, int, int]:
+    """지출결의서 표 한 행의 (공급가액 I, 부가세 J, 배송비 K) = 내역 표의 계산값 그대로.
+
+    공급가액은 내역 표와 같이 배송비를 포함한 값이므로 행 합계 = 공급가액 + 부가세 (배송비 열은 참고용 표시).
+    예) 포함 · 수량 1 · 단가 180,000 → 163,636 + 16,364 = 180,000
+    """
+    return int(rec["공급가액"]), int(rec["부가세"]), int(rec["배송비"])
+
+
+def total_note(info: dict, totals: dict) -> str:
+    """합계 행 오른쪽 안내 문구 (엑셀 L62 · HTML 공용)."""
+    notes = (["배송비는 공급가액에 포함"] if totals["배송비"] else []) + \
+            (["단가에 VAT 포함"] if info["vat_mode"] == "inclusive" else [])
+    return " / ".join(notes) or "-"
+
+
 def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals: dict,
                         body: str, title: str) -> bytes:
     """원본 지출결의서 템플릿(지출결의서_260824.xlsx)을 불러와 지정 셀에 값만 채움 (서식·병합·열 너비·인쇄 설정은 원본 그대로).
@@ -452,7 +469,6 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
     ws["I8"] = f"=I{EXP_TOTAL_ROW}"
 
     # ---- 내역 (11행~) — 서식은 원본 11행(입력 행) 서식을 복사 ----
-    inclusive = info["vat_mode"] == "inclusive"  # 단가에 VAT 포함 → 부가세 칸 0 (단가·배송비에 이미 들어 있음)
     records = items.to_dict("records")
     base_height = ws.row_dimensions[first].height or 45.0
     for i, r in enumerate(range(first, last + 1)):
@@ -469,9 +485,7 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
         ws[f"F{r}"] = rec["업체명"]
         ws[f"G{r}"] = int(rec["수량"]) if float(rec["수량"]).is_integer() else rec["수량"]
         ws[f"H{r}"] = int(rec["단가"]) if float(rec["단가"]).is_integer() else rec["단가"]
-        ws[f"I{r}"] = f"=G{r}*H{r}"  # 공급가액 (배송비는 K열 — I+K = 앱의 공급가액)
-        ws[f"J{r}"] = 0 if inclusive else int(rec["부가세"])  # 배송비분 부가세 포함
-        ws[f"K{r}"] = int(rec["배송비"])
+        ws[f"I{r}"], ws[f"J{r}"], ws[f"K{r}"] = sheet_amounts(rec)  # 내역 표의 공급가액·부가세·배송비 그대로
         ws[f"L{r}"] = rec["비고"] or "-"
         ws.row_dimensions[r].height = max(
             base_height,
@@ -480,13 +494,13 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
             _text_height(rec["비고"], width("LM"), 15.0, 0),
         )
 
-    # ---- 소계(열별 합) / 합계 ----
+    # ---- 소계(열별 합) / 합계 = 공급가액 + 부가세 (공급가액에 배송비가 이미 들어 있어 배송비 열은 더하지 않음) ----
     sub = EXP_SUBTOTAL_ROW
     for col in "IJK":
         ws[f"{col}{sub}"] = f"=SUM({col}{first}:{col}{last})"
     ws[f"L{sub}"] = "-"
-    ws[f"I{EXP_TOTAL_ROW}"] = f"=SUM(I{sub}:K{sub})"
-    ws[f"L{EXP_TOTAL_ROW}"] = "단가에 VAT 포함" if inclusive else "-"
+    ws[f"I{EXP_TOTAL_ROW}"] = f"=I{sub}+J{sub}"
+    ws[f"L{EXP_TOTAL_ROW}"] = total_note(info, totals)
 
     # ---- 결제방법 / 계좌정보 / 법인구분 ----
     ws[f"D{EXP_PAY_ROW}"] = info["pay_method"]
@@ -733,7 +747,6 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
     cols = ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]
     total_w = sum(EXP_WIDTHS[c] for c in cols)
     colgroup = "".join(f'<col style="width:{EXP_WIDTHS[c] / total_w * 100:.2f}%">' for c in cols)
-    inclusive = info["vat_mode"] == "inclusive"
 
     rows = [
         # 제목 / 결재란 (K3:K5는 원본의 빈 칸)
@@ -761,8 +774,7 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
     ]
     sums = {"공급가액": 0, "부가세": 0, "배송비": 0}
     for rec in items.to_dict("records"):
-        line = {"공급가액": int(round(rec["수량"] * rec["단가"])),  # 엑셀 I열과 같음 (배송비는 K열)
-                "부가세": 0 if inclusive else int(rec["부가세"]), "배송비": int(rec["배송비"])}
+        line = dict(zip(("공급가액", "부가세", "배송비"), sheet_amounts(rec)))  # 내역 표 값 그대로 (엑셀 I·J·K와 같음)
         for k, v in line.items():
             sums[k] += v
         rows.append(
@@ -771,13 +783,13 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
             + td(num(line["공급가액"])) + td(num(line["부가세"])) + td(num(line["배송비"]))
             + td(_h(rec["비고"] or "-"), colspan=2) + "</tr>"
         )
-    rows += [  # 소계 = 열별 합, 합계 = 공급가액+부가세+배송비
+    rows += [  # 소계 = 열별 합, 합계 = 공급가액 + 부가세 (= 내역 표 합계)
         "<tr>" + td("소 계", colspan=7, bold=True) + td(num(sums["공급가액"]), bold=True, bg=EXP_LIGHT)
         + td(num(sums["부가세"]), bold=True, bg=EXP_LIGHT) + td(num(sums["배송비"]), bold=True, bg=EXP_LIGHT)
         + td("-", colspan=2) + "</tr>",
         "<tr>" + td("합 계", colspan=7, bold=True)
         + td(f"₩{int(totals['합계']):,}", colspan=3, bold=True, bg=EXP_LIGHT)
-        + td("단가에 VAT 포함" if inclusive else "-", colspan=2) + "</tr>",
+        + td(total_note(info, totals), colspan=2) + "</tr>",
         "<tr>" + td("결제방법", colspan=2, bold=True) + td(_h(info["pay_method"]), colspan=2)
         + td("증빙구분", bold=True) + td(_h(info["evidence"]), colspan=7) + "</tr>",
         "<tr>" + td("계좌정보", colspan=2, bold=True) + td("은행", bold=True) + td(_h(info["bank"] or "-"))
