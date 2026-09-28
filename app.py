@@ -493,7 +493,15 @@ def build_expense_excel(template: Path, info: dict, items: pd.DataFrame, totals:
     ws[f"G{EXP_PAY_ROW}"] = info["evidence"]
     ws[f"E{EXP_ACCOUNT_ROW}"] = info["bank"] or "-"
     ws[f"G{EXP_ACCOUNT_ROW}"] = info["account"] or EXP_TBD
-    ws[f"L{EXP_ACCOUNT_ROW}"] = info["holder"] or EXP_TBD  # 예금주 값 칸 L:M (K는 원본의 빈 칸)
+    # 예금주 값 칸: 원본은 K(빈 칸) + L:M 병합 → K:M 하나로 합쳐 값 칸 서식(원본 L)으로 통일
+    acc = EXP_ACCOUNT_ROW
+    value_style = copy(ws[f"L{acc}"]._style)
+    if f"L{acc}:M{acc}" in {str(m) for m in ws.merged_cells.ranges}:
+        ws.unmerge_cells(f"L{acc}:M{acc}")
+    for col in "KLM":
+        ws[f"{col}{acc}"]._style = copy(value_style)
+    ws.merge_cells(f"K{acc}:M{acc}")
+    ws[f"K{acc}"] = info["holder"] or EXP_TBD
     ws[f"D{EXP_PAYER_ROW}"] = f"  {info['payer']}  입금 요청"
 
     # ---- 품의 문구 (1~4번 + 끝.) ----
@@ -774,7 +782,7 @@ def build_expense_html(info: dict, items: pd.DataFrame, totals: dict, body: str,
         + td("증빙구분", bold=True) + td(_h(info["evidence"]), colspan=7) + "</tr>",
         "<tr>" + td("계좌정보", colspan=2, bold=True) + td("은행", bold=True) + td(_h(info["bank"] or "-"))
         + td("계좌번호", bold=True) + td(_h(info["account"] or EXP_TBD), colspan=3)
-        + td("예금주", bold=True) + td("") + td(_h(info["holder"] or EXP_TBD), colspan=2) + "</tr>",
+        + td("예금주", bold=True) + td(_h(info["holder"] or EXP_TBD), colspan=3) + "</tr>",
         "<tr>" + td("법인구분", colspan=2, bold=True)
         + td(f"&nbsp;&nbsp;{_h(info['payer'])}&nbsp;&nbsp;입금 요청", colspan=10, bold=True, align="left") + "</tr>",
     ]
