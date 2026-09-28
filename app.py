@@ -100,6 +100,9 @@ def form_defaults() -> dict:
 # ---- 임시저장 ----
 DRAFTS_PATH = Path(os.environ.get("JICHUL_DRAFTS_PATH") or APP_DIR / "drafts.json")
 
+# ---- [적용] 상태: 적용한 입력값을 파일에 저장 → 새로고침·재실행해도 유지 ----
+APPLIED_PATH = Path(os.environ.get("JICHUL_APPLIED_PATH") or APP_DIR / "applied.json")
+
 # ---- 생성 문구 수정본 (품의 문구·제목·문자) — 새로고침해도 유지 ----
 TEXT_EDITS_PATH = Path(os.environ.get("JICHUL_TEXT_EDITS_PATH") or APP_DIR / "text_edits.json")
 TEXT_EDITS_MAX = 100
@@ -948,16 +951,104 @@ def save_drafts(drafts: list[dict]) -> None:
     tmp.replace(DRAFTS_PATH)
 
 
-def save_draft() -> None:
-    """[임시저장] 콜백: 현재 입력값을 저장. 불러온 임시저장본을 수정 중이면 그 항목을 덮어씀."""
+def input_snapshot() -> dict:
+    """현재 입력 폼 + 내역 표 → JSON 저장 가능한 dict (임시저장·[적용] 공용)."""
     ss = st.session_state
     form = {}
     for key in form_defaults():
         value = ss.get(key)
         form[key] = value.isoformat() if isinstance(value, date) else value
     items_df = ss.get("items_df", blank_items())
-    items = [{c: (None if isinstance(v, float) and math.isnan(v) else v) for c, v in r.items()}
-             for r in items_df[ITEM_COLUMNS].to_dict("records")]
+    items = []
+    for r in items_df[ITEM_COLUMNS].to_dict("records"):
+        r = {c: (v.item() if hasattr(v, "item") else v) for c, v in r.items()}  # numpy → 파이썬 값 (JSON 비교 안정)
+        items.append({c: (None if isinstance(v, float) and math.isnan(v) else v) for c, v in r.items()})
+    return {"form": form, "items": items}
+
+
+def snapshot_form(snapshot: dict) -> dict:
+    """스냅샷의 form → 위젯 값 (날짜 복원, 빠진 key는 기본값)."""
+    form = {}
+    for key, default in form_defaults().items():
+        value = snapshot.get("form", {}).get(key, default)
+        if key in FORM_DATE_KEYS:
+            try:
+                value = date.fromisoformat(value)
+            except (TypeError, ValueError):
+                value = default
+        form[key] = value
+    return form
+
+
+def snapshot_items(snapshot: dict, vat_mode: str) -> pd.DataFrame:
+    return normalize_items(pd.DataFrame(snapshot.get("items") or [{}], columns=EDITOR_COLUMNS), vat_mode)
+
+
+def restore_inputs(snapshot: dict) -> None:
+    """스냅샷을 입력 폼·내역 표 위젯에 채움."""
+    ss = st.session_state
+    for key, value in snapshot_form(snapshot).items():
+        ss[key] = value
+    bank = ss["f_bank"]
+    if bank and bank not in BANKS:  # 수기 입력한 은행 → 선택 목록에 추가
+        ss["custom_banks"] = list(dict.fromkeys(ss.get("custom_banks", []) + [bank]))
+    _set_items(snapshot_items(snapshot, VAT_MODES.get(ss["f_vat"], "exclusive")))
+
+
+def _same_snapshot(a: dict | None, b: dict | None) -> bool:
+    dump = lambda x: json.dumps([x["form"], x["items"]], ensure_ascii=False, sort_keys=True, default=str)  # noqa: E731
+    return a is not None and b is not None and dump(a) == dump(b)
+
+
+def load_applied() -> dict | None:
+    try:
+        data = json.loads(APPLIED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and "form" in data else None
+
+
+def write_applied(snapshot: dict | None) -> None:
+    try:
+        if snapshot is None:
+            APPLIED_PATH.unlink(missing_ok=True)
+            return
+        tmp = APPLIED_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(APPLIED_PATH)
+    except OSError as exc:
+        st.toast(f"적용 상태 저장 실패: {exc}", icon="⚠️")
+
+
+def apply_inputs(show_toast: bool = True) -> None:
+    """[✅ 적용] 콜백: 현재 입력값을 결과(문구·제목·엑셀·HTML·문자·대장 등록)에 반영하고 파일에 저장."""
+    snapshot = input_snapshot()
+    snapshot["draft_id"] = st.session_state.get("current_draft_id")  # 새로고침 후에도 같은 임시저장본에 덮어쓰도록
+    st.session_state["applied"] = snapshot
+    write_applied(snapshot)
+    if show_toast:
+        st.toast("입력 내용을 적용했습니다. 새로고침해도 유지됩니다.", icon="✅")
+
+
+def restore_applied_once() -> None:
+    """세션 시작(새로고침·재실행) 시 한 번: 저장된 적용 상태를 입력 폼과 결과에 복원."""
+    ss = st.session_state
+    if ss.get("applied_restored"):
+        return
+    ss["applied_restored"] = True
+    snapshot = load_applied()
+    if snapshot:
+        restore_inputs(snapshot)
+        ss["applied"] = snapshot
+        ss["current_draft_id"] = snapshot.get("draft_id")
+
+
+def save_draft() -> None:
+    """[임시저장] 콜백: 현재 입력값을 저장. 불러온 임시저장본을 수정 중이면 그 항목을 덮어씀."""
+    ss = st.session_state
+    snap = input_snapshot()
+    form, items = snap["form"], snap["items"]
+    items_df = ss.get("items_df", blank_items())
     filled = [r for r in items if _text(r["품목"])]
     subject = _text(filled[0]["품목"]) if filled else "(품목 없음)"
     total = int(sum(_num(v) for v in items_df["합계"]))
@@ -987,22 +1078,9 @@ def load_draft(draft_id: str) -> None:
     if draft is None:
         st.toast("임시저장본을 찾을 수 없습니다.", icon="⚠️")
         return
-    defaults = form_defaults()
-    for key, default in defaults.items():
-        value = draft["form"].get(key, default)
-        if key in FORM_DATE_KEYS:
-            try:
-                value = date.fromisoformat(value)
-            except (TypeError, ValueError):
-                value = default
-        ss[key] = value
-    bank = ss["f_bank"]
-    if bank and bank not in BANKS:  # 수기 입력한 은행 → 선택 목록에 추가
-        ss["custom_banks"] = list(dict.fromkeys(ss.get("custom_banks", []) + [bank]))
-    vat_mode = VAT_MODES.get(ss["f_vat"], "exclusive")
-    items = pd.DataFrame(draft.get("items") or [{}], columns=EDITOR_COLUMNS)
-    _set_items(normalize_items(items, vat_mode))
+    restore_inputs(draft)
     ss["current_draft_id"] = draft_id
+    apply_inputs(show_toast=False)  # 불러온 내용은 바로 적용
     ss["main_tab"] = TAB_WRITE
     st.toast(f"임시저장본을 불러왔습니다 ({draft['subject']})", icon="📂")
 
@@ -1024,6 +1102,8 @@ def new_form() -> None:
         st.session_state[key] = value
     _set_items(blank_items())
     st.session_state["current_draft_id"] = None
+    st.session_state["applied"] = None  # 적용 상태도 비움
+    write_applied(None)
 
 
 def render_drafts() -> None:
@@ -1495,13 +1575,13 @@ def render_sidebar() -> dict:
         settings = {
             "company": st.text_input("회사", "GSI").strip(),
             "site": st.text_input("사업장", "본사").strip(),
-            "dept": st.text_input("부서", "인사총무팀").strip(),
+            "dept": st.text_input("부서", "경영지원본부").strip(),
             "drafter": st.text_input("기안자", "김세희 사원").strip(),
         }
         st.divider()
         st.subheader("문자 보고")
         settings["sms_to"] = st.text_input("받는 분", "장미선과장님").strip()
-        settings["sms_from"] = st.text_input("보내는 사람 소개", "GSI(주) 총무팀 사원 김세희").strip()
+        settings["sms_from"] = st.text_input("보내는 사람 소개", "인사총무팀 사원 김세희").strip()
         st.divider()
         settings["unit"] = st.text_input("수량 단위", "개", help="예: 개, 매, 박스, 식")
         st.divider()
@@ -1567,6 +1647,7 @@ def render_items_editor(vat_mode: str) -> pd.DataFrame:
 def render_writer(settings: dict) -> None:
     # ---- 기능 1: 입력 ----
     ss = st.session_state
+    restore_applied_once()  # 새로고침·재실행 시 마지막으로 [적용]한 입력값 복원
     for key, value in form_defaults().items():  # 처음 한 번만 빈 값으로 시작 (샘플 데이터 없음)
         ss.setdefault(key, value)
     st.header("1️⃣ 지출결의서 입력")
@@ -1594,22 +1675,35 @@ def render_writer(settings: dict) -> None:
     st.caption("품목·업체명·수량·단가·배송비·비고를 입력하면 순번·공급가액·부가세·합계가 자동 계산됩니다. "
                "공급가액 = 수량 × 단가 + 배송비 (배송비도 부가세 과세 — 기존 지출결의서·완료기안 양식 기준)")
     vat_mode = VAT_MODES[ss["f_vat"]]
-    items_df = render_items_editor(vat_mode)
+    render_items_editor(vat_mode)
 
-    reason = st.text_area("사유", key="f_reason", height=90, placeholder="예: 업무 수행에 필요한 물품 구매")
-    attachment = st.text_area("첨부", key="f_attachment", height=90, placeholder="예: 가. 견적서 1부.\n나. 통장사본 1부.")
-    remark = st.text_area("특이사항", key="f_remark", height=90, placeholder="없으면 비워 두세요")
+    st.text_area("사유", key="f_reason", height=90, placeholder="예: 업무 수행에 필요한 물품 구매")
+    st.text_area("첨부", key="f_attachment", height=90, placeholder="예: 가. 견적서 1부.\n나. 통장사본 1부.")
+    st.text_area("특이사항", key="f_remark", height=90, placeholder="없으면 비워 두세요")
 
-    items = compute_items(items_df, vat_mode)
+    # ---- [적용]: 여기서부터 아래 결과는 마지막으로 적용한 입력값 기준 ----
+    applied = ss.get("applied")
+    pending = not _same_snapshot(applied, input_snapshot())
+    st.button("✅ 적용", key="btn_apply", type="primary", width="stretch", on_click=apply_inputs,
+              help="입력한 내용을 아래 결과(품의 문구·제목·엑셀·HTML·문자)에 반영합니다. 새로고침해도 유지됩니다.")
+    if applied is None:
+        st.info("입력을 마친 뒤 [✅ 적용]을 누르면 아래에 결과가 만들어집니다.")
+    elif pending:
+        st.warning("적용하지 않은 변경 사항이 있습니다. 아래 결과는 마지막으로 적용한 내용 기준입니다. [✅ 적용]을 눌러 반영하세요.")
+
+    form = snapshot_form(applied or {})
+    vat_mode = VAT_MODES.get(form["f_vat"], "exclusive")
+    items = compute_items(snapshot_items(applied or {}, vat_mode), vat_mode)
     totals = {k: int(items[k].sum()) if not items.empty else 0 for k in ["공급가액", "부가세", "배송비", "합계"]}
-    write_date, pay_date, drafter = ss["f_write_date"], ss["f_pay_date"], settings["drafter"]
+    write_date, pay_date, drafter = form["f_write_date"], form["f_pay_date"], settings["drafter"]
     info = {
-        "write_date": write_date, "drafter": drafter, "doc_no": "", "payer": ss["f_payer"],
-        "requester": drafter, "pay_method": ss["f_pay_method"], "evidence": ss["f_evidence"],
-        "bank": _text(ss["f_bank"]), "account": ss["f_account"].strip(), "holder": ss["f_holder"].strip(),
-        "pay_date": pay_date, "urgent": ss["f_urgent"], "vat_mode": vat_mode, "unit": settings["unit"],
+        "write_date": write_date, "drafter": drafter, "doc_no": "", "payer": form["f_payer"],
+        "requester": drafter, "pay_method": form["f_pay_method"], "evidence": form["f_evidence"],
+        "bank": _text(form["f_bank"]), "account": _text(form["f_account"]), "holder": _text(form["f_holder"]),
+        "pay_date": pay_date, "urgent": bool(form["f_urgent"]), "vat_mode": vat_mode, "unit": settings["unit"],
         "subject": item_summary(items),
-        "reason": reason.strip(), "attachment": attachment.strip(), "remark": remark.strip(),
+        "reason": _text(form["f_reason"]), "attachment": _text(form["f_attachment"]),
+        "remark": _text(form["f_remark"]),
         "company": settings["company"], "site": settings["site"], "dept": settings["dept"],
         "sms_to": settings["sms_to"], "sms_from": settings["sms_from"],
     }
@@ -1624,8 +1718,10 @@ def render_writer(settings: dict) -> None:
     c3.button("🆕 새로 작성", key="btn_new", width="stretch", on_click=new_form,
               help="입력 내용을 모두 비웁니다 (임시저장본은 그대로 남음).")
 
+    if applied is None:
+        return
     if items.empty:
-        st.info("내역에 품목을 1개 이상 입력하세요.")
+        st.info("내역에 품목을 1개 이상 입력하고 [✅ 적용]을 누르세요.")
         return
 
     # 문서번호는 발급 대장에서 입력 → 같은 건이 대장에 있으면 그 문서번호를 완료기안에 사용
